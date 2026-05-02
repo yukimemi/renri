@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 
 pub mod detect;
 pub mod git;
+pub mod jj;
 
 pub use detect::{Kind, Repo, detect};
 
@@ -111,10 +112,9 @@ pub fn select_kind(repo_kind: Kind, choice: VcsChoice) -> Result<Kind> {
 pub fn open_backend(repo: &Repo, kind: Kind) -> Result<Box<dyn Backend>> {
     match kind {
         Kind::Git => Ok(Box::new(git::GitBackend::new(&repo.root))),
-        Kind::Jj | Kind::Colocated => bail!(
-            "the jj backend is not implemented yet; \
-             use --vcs git on a colocated repo, or wait for the next release"
-        ),
+        Kind::Jj => Ok(Box::new(jj::JjBackend::new(&repo.root))),
+        // select_kind never returns Colocated.
+        Kind::Colocated => unreachable!("select_kind resolves Colocated to Git or Jj"),
     }
 }
 
