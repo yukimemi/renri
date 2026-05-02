@@ -117,12 +117,24 @@ per clone. Individual tasks:
 - `cargo make hook-install` — wires `.git/hooks/pre-push` to
   `cargo make check`.
 - `cargo make apm-install` — runs `apm install`, compiling renri's
-  own skill from `.apm/skills/renri/SKILL.md` into the
-  agent-facing `.github/skills/renri/SKILL.md`. renri **dogfoods
-  APM** — the source-of-truth skill lives in `.apm/`, the
-  compiled output is committed for visibility, and `apm.lock.yaml`
-  pins the resolution. When the skill content changes, re-run
-  `cargo make apm-install` and commit both files.
+  own skill from `.apm/skills/renri/SKILL.md` into
+  `.claude/skills/renri/SKILL.md` + `.gemini/skills/renri/SKILL.md` +
+  `.github/skills/renri/SKILL.md`. **Requires the
+  [APM](https://github.com/microsoft/apm) CLI on `PATH`** —
+  `scoop install apm` (Windows), `brew install microsoft/apm/apm`
+  (macOS), `pip install apm-cli`, or
+  `curl -sSL https://aka.ms/apm-unix | sh`.
+  renri **dogfoods APM** — the source-of-truth skill lives in
+  `.apm/`, the compiled outputs are committed for visibility, and
+  `apm.lock.yaml` pins the resolution. When the skill content
+  changes, re-run `cargo make apm-install` and commit the updated
+  files.
+
+renri is itself **a publishable APM package** (`apm install
+yukimemi/renri` resolves to a tag matching `apm.yml`'s `version`).
+That's why `apm.yml` carries a real, bumping version — when cutting
+a release, bump `Cargo.toml`, `Cargo.lock`, and `apm.yml` together,
+then tag.
 
 `cargo make check` mirrors CI exactly. The pre-push hook runs it,
 so failed checks block push.

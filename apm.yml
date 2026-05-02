@@ -1,3 +1,6 @@
+# renri is a publishable APM package — `apm install yukimemi/renri`
+# resolves to a tag matching this `version`. Bump it together with
+# Cargo.toml / Cargo.lock when releasing a new tag.
 name: renri
 version: 0.1.5
 description: 'Skill describing how to use the renri CLI — a unified manager for git
