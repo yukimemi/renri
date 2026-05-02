@@ -105,6 +105,23 @@ worktree_root = "{{ env(name='HOME') }}/wt"
 renri prune
 ```
 
+**Per-worktree dev-server ports (no more `:3000` collisions):**
+
+```toml
+# renri.toml
+[layout]
+worktree_root = "{{ env(name='HOME') }}/wt"
+
+[[hooks.post_create]]
+type = "command"
+run = "echo PORT={{ vcs.branch | hash | port_offset(start=3000, range=1000) }} > .env.local"
+```
+
+`hash` and `port_offset` are teravars Tera filters. The pipeline
+turns each branch name into a deterministic port in `[3000, 4000)`,
+so three concurrent worktrees of the same project never fight for
+the same port.
+
 ## Install renri itself
 
 The skill describes how to use `renri`; you still need the binary on

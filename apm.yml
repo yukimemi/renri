@@ -1,5 +1,5 @@
 name: renri
-version: 0.1.4
+version: 0.1.5
 description: |
   Skill describing how to use the renri CLI — a unified manager for git
   worktrees and jujutsu workspaces, configured via teravars-powered TOML.
