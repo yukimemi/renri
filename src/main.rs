@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use teravars::{Engine, system_context};
 
-use renri::{config, hooks, layout, picker, vcs};
+use renri::{config, hooks, layout, picker, shell_init, vcs};
 
 #[derive(Parser, Debug)]
 #[command(name = "renri", version, about, long_about = None)]
@@ -77,6 +77,13 @@ enum Command {
     /// Garbage-collect worktrees / stale jj workspaces.
     Prune,
 
+    /// Print a shell snippet that makes `renri cd` actually `cd` the
+    /// parent shell. Source it from your shell's startup file.
+    ShellInit {
+        #[arg(value_enum)]
+        shell: shell_init::Shell,
+    },
+
     /// Manage configuration.
     Config {
         #[command(subcommand)]
@@ -114,6 +121,10 @@ fn main() -> Result<()> {
         Command::Cd { name } => cmd_cd(choice, name, non_interactive),
         Command::Exec { name, argv } => cmd_exec(choice, name, argv, non_interactive),
         Command::Prune => cmd_prune(choice),
+        Command::ShellInit { shell } => {
+            print!("{}", shell_init::snippet(shell));
+            Ok(())
+        }
     }
 }
 
