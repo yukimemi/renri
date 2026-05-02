@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use teravars::{Engine, system_context};
 
-use renri::{config, layout, vcs};
+use renri::{config, hooks, layout, vcs};
 
 #[derive(Parser, Debug)]
 #[command(name = "renri", version, about, long_about = None)]
@@ -102,13 +102,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let choice = vcs_choice(cli.vcs);
+    let non_interactive = cli.non_interactive;
 
     match cli.command {
         Command::List => cmd_list(choice),
         Command::Config {
             sub: ConfigCommand::Show,
         } => cmd_config_show(choice),
-        Command::Add { .. } => not_yet("add"),
+        Command::Add { name } => cmd_add(choice, name, non_interactive),
         Command::Remove { .. } => not_yet("remove"),
         Command::Cd { .. } => not_yet("cd"),
         Command::Exec { .. } => not_yet("exec"),
@@ -241,6 +242,77 @@ fn cmd_config_show(choice: vcs::VcsChoice) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cmd_add(choice: vcs::VcsChoice, name: Option<String>, non_interactive: bool) -> Result<()> {
+    let name = match name {
+        Some(n) => n.trim().to_string(),
+        None => prompt_branch_name(non_interactive)?,
+    };
+    if name.is_empty() {
+        anyhow::bail!("branch / bookmark name must not be empty");
+    }
+
+    let opened = open_repo_backend(choice)?;
+    let mut engine = Engine::new();
+
+    let loaded = config::Config::load_with_engine(Some(&opened.repo.root), &mut engine)?;
+
+    let vcs_ctx = layout::discover_vcs_context(opened.backend.as_ref(), &opened.repo.root, &name);
+    let base_ctx = system_context();
+
+    let path = layout::render_path(
+        &mut engine,
+        &base_ctx,
+        &vcs_ctx,
+        loaded.config.layout.worktree_root.as_deref(),
+        loaded.config.layout.worktree_path.as_deref(),
+    )?;
+
+    if path.exists() {
+        anyhow::bail!(
+            "target path already exists: {}\n\
+             remove it manually or pick a different branch name",
+            path.display()
+        );
+    }
+
+    let strategy = if opened.backend.branch_exists(&name) {
+        tracing::info!(branch = %name, "attaching to existing branch");
+        vcs::AddBranch::ExistingBranch(&name)
+    } else {
+        tracing::info!(branch = %name, "creating new branch off HEAD");
+        vcs::AddBranch::NewBranch(&name)
+    };
+
+    println!("creating worktree at {}", path.display());
+    opened.backend.add(&path, strategy)?;
+
+    let post = &loaded.config.hooks.post_create;
+    if !post.is_empty() {
+        println!("running {} post_create hook(s)", post.len());
+        let mut hr = hooks::HookRun {
+            repo_root: &opened.repo.root,
+            worktree_path: &path,
+            vcs: &vcs_ctx,
+            engine: &mut engine,
+            base_ctx: &base_ctx,
+        };
+        hooks::run_all(post, &mut hr)?;
+    }
+
+    println!("done. {}", path.display());
+    Ok(())
+}
+
+fn prompt_branch_name(non_interactive: bool) -> Result<String> {
+    if non_interactive {
+        anyhow::bail!("--non-interactive set and no branch name was given");
+    }
+    let answer = inquire::Text::new("branch / bookmark name?")
+        .prompt()
+        .context("interactive prompt cancelled")?;
+    Ok(answer.trim().to_string())
 }
 
 fn not_yet(verb: &str) -> Result<()> {

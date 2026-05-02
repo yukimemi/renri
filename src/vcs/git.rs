@@ -5,7 +5,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use super::{Backend, Worktree};
+use super::{AddBranch, Backend, Worktree};
 
 pub struct GitBackend {
     root: PathBuf,
@@ -48,13 +48,19 @@ impl Backend for GitBackend {
         Ok(parse_porcelain(&stdout))
     }
 
-    fn add(&self, path: &Path, branch: Option<&str>) -> Result<()> {
+    fn add(&self, path: &Path, branch: AddBranch) -> Result<()> {
         let mut cmd = self.git();
         cmd.args(["worktree", "add"]);
-        if let Some(b) = branch {
-            cmd.args(["-b", b]);
+        match branch {
+            AddBranch::NewBranch(name) => {
+                cmd.args(["-b", name]);
+                cmd.arg(path);
+            }
+            AddBranch::ExistingBranch(name) => {
+                cmd.arg(path);
+                cmd.arg(name);
+            }
         }
-        cmd.arg(path);
         let status = cmd.status().context("failed to spawn `git`")?;
         if !status.success() {
             bail!("git worktree add failed");
@@ -100,6 +106,18 @@ impl Backend for GitBackend {
         }
         let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if s.is_empty() { None } else { Some(s) }
+    }
+
+    fn branch_exists(&self, name: &str) -> bool {
+        let Ok(output) = self
+            .git()
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{name}"))
+            .output()
+        else {
+            return false;
+        };
+        output.status.success()
     }
 }
 

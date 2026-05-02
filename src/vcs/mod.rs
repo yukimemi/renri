@@ -39,13 +39,22 @@ pub struct Worktree {
     pub is_locked: bool,
 }
 
+/// How a worktree should be hooked up to a branch when adding it.
+#[derive(Debug, Clone, Copy)]
+pub enum AddBranch<'a> {
+    /// Create a new branch with this name off the current HEAD.
+    NewBranch(&'a str),
+    /// Attach to an already-existing branch.
+    ExistingBranch(&'a str),
+}
+
 pub trait Backend {
     /// Display name of the backend ("git" / "jj").
     fn name(&self) -> &str;
 
     fn list(&self) -> Result<Vec<Worktree>>;
 
-    fn add(&self, path: &Path, branch: Option<&str>) -> Result<()>;
+    fn add(&self, path: &Path, branch: AddBranch) -> Result<()>;
 
     fn remove(&self, path: &Path, force: bool) -> Result<()>;
 
@@ -58,6 +67,11 @@ pub trait Backend {
     /// Current branch (git) / bookmark at @-commit (jj). Default: `None`.
     fn current_branch(&self) -> Option<String> {
         None
+    }
+
+    /// Does a branch / bookmark with this name already exist?
+    fn branch_exists(&self, _name: &str) -> bool {
+        false
     }
 }
 
