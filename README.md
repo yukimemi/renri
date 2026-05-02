@@ -1,6 +1,6 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-  <img src="assets/logo.svg" alt="renri — git worktrees + jj workspaces, unified" width="540">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/yukimemi/renri/main/assets/logo-dark.svg">
+  <img src="https://raw.githubusercontent.com/yukimemi/renri/main/assets/logo.svg" alt="renri — git worktrees + jj workspaces, unified" width="540">
 </picture>
 
 > 連理 — *intertwined branches*. A unified manager for **git worktrees**
