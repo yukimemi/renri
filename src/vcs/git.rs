@@ -119,6 +119,21 @@ impl Backend for GitBackend {
         };
         output.status.success()
     }
+
+    fn prune(&self) -> Result<String> {
+        let output = self
+            .git()
+            .args(["worktree", "prune", "--verbose"])
+            .output()
+            .context("failed to spawn `git`")?;
+        if !output.status.success() {
+            bail!(
+                "git worktree prune: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
 }
 
 /// Parse the output of `git worktree list --porcelain`.

@@ -113,7 +113,7 @@ fn main() -> Result<()> {
         Command::Remove { name } => cmd_remove(choice, name, non_interactive),
         Command::Cd { name } => cmd_cd(choice, name, non_interactive),
         Command::Exec { name, argv } => cmd_exec(choice, name, argv, non_interactive),
-        Command::Prune => not_yet("prune"),
+        Command::Prune => cmd_prune(choice),
     }
 }
 
@@ -376,6 +376,18 @@ fn cmd_exec(
     Ok(())
 }
 
+fn cmd_prune(choice: vcs::VcsChoice) -> Result<()> {
+    let opened = open_repo_backend(choice)?;
+    let output = opened.backend.prune()?;
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        println!("nothing to prune");
+    } else {
+        println!("{trimmed}");
+    }
+    Ok(())
+}
+
 fn prompt_branch_name(non_interactive: bool) -> Result<String> {
     if non_interactive {
         anyhow::bail!("--non-interactive set and no branch name was given");
@@ -384,8 +396,4 @@ fn prompt_branch_name(non_interactive: bool) -> Result<String> {
         .prompt()
         .context("interactive prompt cancelled")?;
     Ok(answer.trim().to_string())
-}
-
-fn not_yet(verb: &str) -> Result<()> {
-    anyhow::bail!("`renri {verb}` is not yet implemented — see ROADMAP.md")
 }

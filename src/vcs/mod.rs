@@ -73,6 +73,14 @@ pub trait Backend {
     fn branch_exists(&self, _name: &str) -> bool {
         false
     }
+
+    /// Garbage-collect stale worktree metadata. For git: removes entries
+    /// whose on-disk directory has been deleted. For jj: forgets workspaces
+    /// whose root path is gone. Returns whatever stdout the underlying
+    /// command produced, so the CLI can surface it to the user.
+    fn prune(&self) -> Result<String> {
+        Ok(String::new())
+    }
 }
 
 /// Pick which backend to use given the detected repo kind and the user's
