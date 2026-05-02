@@ -1,0 +1,7 @@
+name: renri
+version: 0.1.3
+description: |
+  Skill describing how to use the renri CLI — a unified manager for git
+  worktrees and jujutsu workspaces, configured via teravars-powered TOML.
+  Install with `apm install yukimemi/renri` to make this skill available
+  to Copilot, Claude Code, Cursor, OpenCode, Codex, and Gemini at once.

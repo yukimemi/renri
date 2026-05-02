@@ -87,10 +87,21 @@ Invoke-Expression (& renri shell-init powershell)
 
 ## AI / agent integration
 
-Drop [`claude-skill.md`](./claude-skill.md) into your Claude Code
-skills directory; the agent will then know the verbs and
-conventions. An MCP server is planned for v0.2 so any
-MCP-compatible AI client can drive renri directly.
+renri ships an [APM](https://github.com/microsoft/apm) package, so
+the easiest cross-agent install (Copilot / Claude Code / Cursor /
+OpenCode / Codex / Gemini) is:
+
+```sh
+apm install yukimemi/renri
+```
+
+For Claude Code only, you can also drop
+[`claude-skill.md`](./claude-skill.md) directly into
+`~/.claude/skills/` — same content as the APM-installed
+`.apm/skills/renri/SKILL.md`, just shipped without the APM layer.
+
+An MCP server is planned for v0.2 so MCP-compatible AI clients can
+drive renri verbs directly without going through `bash`.
 
 ## Cargo features
 
