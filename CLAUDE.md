@@ -109,10 +109,21 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo make check                    # all of the above (pre-push gate)
 cargo make hook-install             # install pre-push hook (one-time)
+
+apm install                         # compile renri's own skill into
+                                    # .github/skills/ so AI agents in
+                                    # this repo know about renri
 ```
 
 `cargo make check` mirrors CI. The pre-push hook should be installed
 on checkout so failed checks block push.
+
+renri **dogfoods APM on itself.** The skill source of truth is
+`.apm/skills/renri/SKILL.md`; running `apm install` from the repo
+root compiles it into `.github/skills/renri/SKILL.md` (and that
+location is committed so new contributors see the skill before
+running APM). The lockfile `apm.lock.yaml` is also committed. When
+the skill content changes, re-run `apm install` and commit both.
 
 ## Resilience principle
 

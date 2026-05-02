@@ -1,0 +1,6 @@
+lockfile_version: '1'
+generated_at: '2026-05-02T14:27:42.068581+00:00'
+apm_version: 0.11.0
+dependencies: []
+local_deployed_files:
+- .github/skills/renri
