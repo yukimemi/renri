@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="renri">
+  <title>renri — intertwined branches: git worktrees + jj workspaces</title>
+  <!--
+    連理 (renri) — two branches from neighbouring trees that grow into
+    each other, a classical metaphor for inseparability. The CLI ties
+    git worktrees and jj workspaces in the same way.
+
+    Two arcs cross near the centre; a gold diamond marks the tie point
+    (the same visual language as yui's bind-point diamond).
+  -->
+  <g fill="none" stroke-width="22" stroke-linecap="round">
+    <!-- Left tree's branch — warm rust orange, rooted at bottom-left -->
+    <path d="M 56 220 C 56 130, 92 100, 168 78" stroke="#c5582d" />
+    <!-- Right tree's branch — cool teal, rooted at bottom-right -->
+    <path d="M 200 220 C 200 130, 164 100, 88 78" stroke="#0a7e8c" />
+  </g>
+  <!-- Tie-point diamond at the crossing -->
+  <rect x="120" y="120" width="16" height="16"
+        transform="rotate(45 128 128)"
+        fill="#c9a227" />
+</svg>
