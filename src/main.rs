@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use teravars::{Engine, system_context};
 
-use renri::{config, hooks, layout, vcs};
+use renri::{config, hooks, layout, picker, vcs};
 
 #[derive(Parser, Debug)]
 #[command(name = "renri", version, about, long_about = None)]
@@ -110,9 +110,9 @@ fn main() -> Result<()> {
             sub: ConfigCommand::Show,
         } => cmd_config_show(choice),
         Command::Add { name } => cmd_add(choice, name, non_interactive),
-        Command::Remove { .. } => not_yet("remove"),
-        Command::Cd { .. } => not_yet("cd"),
-        Command::Exec { .. } => not_yet("exec"),
+        Command::Remove { name } => cmd_remove(choice, name, non_interactive),
+        Command::Cd { name } => cmd_cd(choice, name, non_interactive),
+        Command::Exec { name, argv } => cmd_exec(choice, name, argv, non_interactive),
         Command::Prune => not_yet("prune"),
     }
 }
@@ -302,6 +302,77 @@ fn cmd_add(choice: vcs::VcsChoice, name: Option<String>, non_interactive: bool) 
     }
 
     println!("done. {}", path.display());
+    Ok(())
+}
+
+fn cmd_cd(choice: vcs::VcsChoice, name: Option<String>, non_interactive: bool) -> Result<()> {
+    let opened = open_repo_backend(choice)?;
+    let worktrees = opened.backend.list()?;
+    let picked = picker::resolve(&worktrees, name.as_deref(), non_interactive, "switch to:")?;
+    println!("{}", picked.path.display());
+    Ok(())
+}
+
+fn cmd_remove(choice: vcs::VcsChoice, name: Option<String>, non_interactive: bool) -> Result<()> {
+    let opened = open_repo_backend(choice)?;
+    let mut engine = Engine::new();
+    let loaded = config::Config::load_with_engine(Some(&opened.repo.root), &mut engine)?;
+
+    let worktrees = opened.backend.list()?;
+    let picked = picker::resolve(&worktrees, name.as_deref(), non_interactive, "remove:")?.clone();
+
+    if picked.is_main {
+        anyhow::bail!(
+            "{} is the main worktree and cannot be removed via renri",
+            picked.name
+        );
+    }
+
+    let pre = &loaded.config.hooks.pre_remove;
+    if !pre.is_empty() {
+        let branch = picked.branch.clone().unwrap_or_else(|| picked.name.clone());
+        let vcs_ctx =
+            layout::discover_vcs_context(opened.backend.as_ref(), &opened.repo.root, &branch);
+        let base_ctx = system_context();
+        let mut hr = hooks::HookRun {
+            repo_root: &opened.repo.root,
+            worktree_path: &picked.path,
+            vcs: &vcs_ctx,
+            engine: &mut engine,
+            base_ctx: &base_ctx,
+        };
+        println!("running {} pre_remove hook(s)", pre.len());
+        hooks::run_all(pre, &mut hr)?;
+    }
+
+    println!("removing {}", picked.path.display());
+    opened.backend.remove(&picked.path, false)?;
+    Ok(())
+}
+
+fn cmd_exec(
+    choice: vcs::VcsChoice,
+    name: Option<String>,
+    argv: Vec<String>,
+    non_interactive: bool,
+) -> Result<()> {
+    if argv.is_empty() {
+        anyhow::bail!("no command was given (use `renri exec <name> -- cmd args...`)");
+    }
+
+    let opened = open_repo_backend(choice)?;
+    let worktrees = opened.backend.list()?;
+    let picked = picker::resolve(&worktrees, name.as_deref(), non_interactive, "exec in:")?;
+
+    let status = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(&picked.path)
+        .status()
+        .with_context(|| format!("failed to spawn `{}`", argv[0]))?;
+
+    if !status.success() {
+        anyhow::bail!("`{}` exited with {status}", argv[0]);
+    }
     Ok(())
 }
 

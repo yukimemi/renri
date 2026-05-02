@@ -3,4 +3,5 @@
 pub mod config;
 pub mod hooks;
 pub mod layout;
+pub mod picker;
 pub mod vcs;
