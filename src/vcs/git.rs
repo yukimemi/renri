@@ -75,6 +75,32 @@ impl Backend for GitBackend {
         }
         Ok(())
     }
+
+    fn origin_url(&self) -> Option<String> {
+        let output = self
+            .git()
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
+
+    fn current_branch(&self) -> Option<String> {
+        let output = self
+            .git()
+            .args(["branch", "--show-current"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
 }
 
 /// Parse the output of `git worktree list --porcelain`.

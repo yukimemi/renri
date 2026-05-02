@@ -1018,12 +1018,14 @@ dependencies = [
  "inquire",
  "pretty_assertions",
  "serde",
+ "serde_json",
  "tempfile",
  "teravars",
  "thiserror",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "whoami",
 ]
 
 [[package]]

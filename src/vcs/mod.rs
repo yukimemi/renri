@@ -48,6 +48,17 @@ pub trait Backend {
     fn add(&self, path: &Path, branch: Option<&str>) -> Result<()>;
 
     fn remove(&self, path: &Path, force: bool) -> Result<()>;
+
+    /// URL of the origin remote, if one is configured. Used by the layout
+    /// renderer to extract owner / repo / host. Default impl returns `None`.
+    fn origin_url(&self) -> Option<String> {
+        None
+    }
+
+    /// Current branch (git) / bookmark at @-commit (jj). Default: `None`.
+    fn current_branch(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Pick which backend to use given the detected repo kind and the user's
