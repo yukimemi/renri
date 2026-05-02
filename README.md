@@ -87,18 +87,16 @@ Invoke-Expression (& renri shell-init powershell)
 
 ## AI / agent integration
 
-renri ships an [APM](https://github.com/microsoft/apm) package, so
-the easiest cross-agent install (Copilot / Claude Code / Cursor /
-OpenCode / Codex / Gemini) is:
+renri ships as an [APM](https://github.com/microsoft/apm) package.
+One command gives the renri skill to every detected agent client
+(Copilot / Claude Code / Cursor / OpenCode / Codex / Gemini):
 
 ```sh
 apm install yukimemi/renri
 ```
 
-For Claude Code only, you can also drop
-[`claude-skill.md`](./claude-skill.md) directly into
-`~/.claude/skills/` — same content as the APM-installed
-`.apm/skills/renri/SKILL.md`, just shipped without the APM layer.
+The skill source lives at `.apm/skills/renri/SKILL.md`; APM compiles
+it into the right format for each agent on install.
 
 An MCP server is planned for v0.2 so MCP-compatible AI clients can
 drive renri verbs directly without going through `bash`.

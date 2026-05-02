@@ -91,9 +91,13 @@ before reverting any of them.
   `jj workspace prune`. We list workspaces and forget the ones whose
   root path is gone. This is one of the main reasons renri exists
   for jj users — flag with the user before changing how it behaves.
-- **AI integration is Skill-first.** `claude-skill.md` ships in the
-  repo for users to drop into Claude Code. MCP server is a v0.2
-  item; Skill is zero-effort and Claude-Code-only is fine for MVP.
+- **AI integration goes through APM.** The skill at
+  `.apm/skills/renri/SKILL.md` is the single source of truth;
+  Microsoft's [APM](https://github.com/microsoft/apm) compiles it
+  into the right format for Copilot / Claude Code / Cursor /
+  OpenCode / Codex / Gemini on `apm install yukimemi/renri`. We
+  intentionally do **not** ship a parallel Claude-only `skill.md` —
+  duplicate content drifts. MCP server is still a v0.2 item.
 
 ## Development
 

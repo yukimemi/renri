@@ -117,9 +117,10 @@ shell function that wraps `cd "$(renri cd $@)"` so users can type
 
 ### MVP also ships
 
-- `claude-skill.md` — a Markdown file users can drop into
-  `~/.claude/skills/` so Claude Code knows the verbs and conventions.
-  No MCP server in MVP.
+- APM package: `apm.yml` + `.apm/skills/renri/SKILL.md` so
+  `apm install yukimemi/renri` installs the skill across every
+  detected agent client (Copilot / Claude Code / Cursor / OpenCode
+  / Codex / Gemini). MCP server is v0.2.
 - README, ROADMAP, LICENSE (MIT), CI matrix (linux/win/mac × default
   features), release workflow on tag.
 
