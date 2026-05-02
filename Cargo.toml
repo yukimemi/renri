@@ -1,0 +1,28 @@
+[package]
+name = "renri"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["yukimemi <yukimemi@gmail.com>"]
+license = "MIT"
+description = "Unified manager for git worktrees and jujutsu workspaces, configured with teravars"
+repository = "https://github.com/yukimemi/renri"
+readme = "README.md"
+categories = ["command-line-utilities", "development-tools"]
+keywords = ["git", "worktree", "jujutsu", "jj", "workspace"]
+
+[dependencies]
+teravars = "0.1"
+clap = { version = "4", features = ["derive"] }
+inquire = "0.7"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"

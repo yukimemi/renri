@@ -1,0 +1,76 @@
+# renri
+
+> 連理 — *intertwined branches*. A unified manager for **git worktrees**
+> and **jujutsu (jj) workspaces**, driven by [teravars]-powered TOML
+> configuration with per-host / per-OS overrides and a shared base
+> include mechanism.
+
+**Status: 0.0.x — scaffolding only. MVP plan in [ROADMAP.md](./ROADMAP.md).**
+
+## Why
+
+The existing crop of worktree CLIs (gwq, wtp, Phantom, claude-squad,
+Worktrunk, …) all assume git, all use a different config format, and
+none of them treat **jj workspaces** as first-class peers. The teams
+shipping AI-parallel-dev workflows have their config and conventions
+re-implemented across N tools.
+
+`renri` aims to be the local CLI that:
+
+- **Auto-detects git or jj**, dispatches to the right backend, exposes
+  one verb set (`add` / `list` / `remove` / `cd` / `exec` / `prune` /
+  `config`).
+- **Configures with TOML + Tera** via the [teravars] library, so a
+  single `renri.toml` can `include = ["team-base.toml"]`, render
+  `{% if system.host == "thinkpad" %} ...` for per-machine overrides,
+  and use the standard `env(...)` / `is_windows()` helpers.
+- **Falls back to interactive picker** for any required argument that
+  was omitted on the command line — `renri cd` opens a fuzzy filter,
+  but `renri cd feature/foo` switches directly. `--non-interactive`
+  disables the fallback for scripts and CI.
+- **Treats jj workspaces honestly** — surfaces `update-stale`, ships
+  the prune behaviour that `jj workspace forget` is missing, handles
+  the colocated-git+jj case where `git worktree add` requires `-b`.
+
+## Quick example (planned)
+
+```toml
+# renri.toml
+include = ["{{ env(name='RENRI_TEAM_BASE', default='') }}"]
+
+[layout]
+worktree_root = "{{ env(name='HOME') }}/wt"
+worktree_path = "{{ vcs.owner }}/{{ vcs.repo }}/{{ vcs.branch | replace(from='/', to='-') }}"
+
+[[hooks.post_create]]
+type = "copy"
+files = [".env.example -> .env"]
+
+[[hooks.post_create]]
+type = "command"
+run = "pnpm install"
+
+{% if system.os == "windows" %}
+[[hooks.post_create]]
+type = "command"
+shell = "pwsh"
+run = "Write-Host 'Welcome to {{ vcs.branch }}'"
+{% endif %}
+```
+
+```sh
+renri add feature/auth          # creates the worktree, runs hooks
+renri cd feature/auth           # prints the path (or opens picker if no arg)
+renri exec feature/auth -- pnpm test
+renri prune                     # gc stale worktrees / forgotten jj workspaces
+```
+
+## Cargo features
+
+(none yet — added as needed.)
+
+## License
+
+MIT.
+
+[teravars]: https://github.com/yukimemi/teravars
