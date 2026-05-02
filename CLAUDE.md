@@ -104,26 +104,28 @@ before reverting any of them.
 **Practice TDD.** Red-green-refactor.
 
 ```bash
+cargo make setup                    # one-time on clone: hook + apm install
 cargo test                          # unit + (eventual) integration
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo make check                    # all of the above (pre-push gate)
-cargo make hook-install             # install pre-push hook (one-time)
-
-apm install                         # compile renri's own skill into
-                                    # .github/skills/ so AI agents in
-                                    # this repo know about renri
 ```
 
-`cargo make check` mirrors CI. The pre-push hook should be installed
-on checkout so failed checks block push.
+`cargo make setup` is `hook-install` + `apm-install` — runs once
+per clone. Individual tasks:
 
-renri **dogfoods APM on itself.** The skill source of truth is
-`.apm/skills/renri/SKILL.md`; running `apm install` from the repo
-root compiles it into `.github/skills/renri/SKILL.md` (and that
-location is committed so new contributors see the skill before
-running APM). The lockfile `apm.lock.yaml` is also committed. When
-the skill content changes, re-run `apm install` and commit both.
+- `cargo make hook-install` — wires `.git/hooks/pre-push` to
+  `cargo make check`.
+- `cargo make apm-install` — runs `apm install`, compiling renri's
+  own skill from `.apm/skills/renri/SKILL.md` into the
+  agent-facing `.github/skills/renri/SKILL.md`. renri **dogfoods
+  APM** — the source-of-truth skill lives in `.apm/`, the
+  compiled output is committed for visibility, and `apm.lock.yaml`
+  pins the resolution. When the skill content changes, re-run
+  `cargo make apm-install` and commit both files.
+
+`cargo make check` mirrors CI exactly. The pre-push hook runs it,
+so failed checks block push.
 
 ## Resilience principle
 
