@@ -53,9 +53,9 @@ echo "Installed pre-push hook -> ${hook_file}"
 '''
 
 [tasks.apm-install]
-description = "Compile renri's own skill into .github/skills/ + .claude/skills/ via APM (dogfood)"
+description = "Compile renri's own skill into .claude/skills/ + .gemini/skills/ + .github/skills/ via APM (dogfood)"
 command = "apm"
-args = ["install", "-t", "copilot,claude"]
+args = ["install", "-t", "copilot,claude,gemini"]
 
 [tasks.setup]
 description = "One-time setup for new contributors: pre-push hook + APM compile"

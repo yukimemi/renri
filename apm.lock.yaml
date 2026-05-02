@@ -4,4 +4,5 @@ apm_version: 0.11.0
 dependencies: []
 local_deployed_files:
 - .claude/skills/renri
+- .gemini/skills/renri
 - .github/skills/renri
