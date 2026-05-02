@@ -128,20 +128,44 @@ shell function that wraps `cd "$(renri cd $@)"` so users can type
 
 ## v0.2 candidates
 
-- **MCP server** (`renri mcp serve`) for cross-AI agent integration
-  (Phantom-style).
-- **Deterministic resource allocation**: `port_offset(start, range)`,
-  `hash` filter — so `[vars] dev_port = "{{ vcs.branch | hash | port_offset(start=3000, range=1000) }}"` Just Works. Filters live
-  in teravars (so other CLIs benefit), wired up here as a default.
-- **More hook phases**: `pre_switch`, `post_switch`, `pre_merge`,
-  `post_merge`.
+Theme: **practical friction users will hit when they actually use
+renri daily**. Skip speculative AI-protocol work — the APM skill +
+plain `bash` invocation reaches every agent client today, and we
+have no usage signal that typed tool calls are needed yet.
+
+- **Deterministic resource allocation** — `hash`, `port_offset(start, range)`
+  filters in teravars so callers can write
+  `[vars] dev_port = "{{ vcs.branch | hash | port_offset(start=3000, range=1000) }}"`.
+  Solves the canonical "3 worktrees of one project, 3 dev servers all
+  fight over `:3000`" problem. Filters live in teravars (other CLIs
+  benefit), wired into renri's default skill content as a recipe.
+- **More hook phases** — `pre_switch`, `post_switch`, `pre_remove`
+  fully exercised, `pre_add` for project-side validation. The
+  `[[hooks.<phase>]]` schema is unchanged; only the executor's call
+  sites grow.
+- **Skill content quality** — expand
+  `.apm/skills/renri/SKILL.md` from a verb list into
+  cookbook-style "user wants X → command Y" entries (dev-server
+  ports, per-host roots, cleanup after `rm -rf`, switching agents
+  per worktree, etc). This is leverage: every agent client gets
+  smarter on `apm install`.
+- **`renri ai <name> [--agent <claude|codex|amp|...>]`** — thin
+  wrapper over `exec` that picks the right agent CLI from config or
+  `RENRI_AI_AGENT`. Saves the user from typing `renri exec foo -- claude`
+  every time.
 - **Pre-built binaries via GitHub Releases** alongside cargo publish.
 - **PR-driven worktree creation** (`renri add --pr 123`).
 - **Per-branch state vars** (`renri var set <key> <value>`) à la
   Worktrunk.
 
-## v0.3 / not in scope (yet)
+## v0.3 / later
 
+- **MCP server** (`renri mcp serve`) for typed cross-agent
+  integration. Deferred from v0.2: marginal value over skill +
+  `bash` for renri's small surface area; revisit when we have
+  user-reported friction (output parsing fragility, shell-escape
+  pain, or a verb whose args don't fit cleanly into a one-line
+  shell call).
 - Sandbox / container isolation per worktree.
 - Multi-agent fan-out (claude-squad territory).
 - Web UI / TUI dashboard.
