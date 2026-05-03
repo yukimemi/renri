@@ -1,6 +1,9 @@
 # renri.toml
 # Schema and examples: https://github.com/yukimemi/renri
 
+[ui]
+show_pr = true
+
 [[hooks.post_create]]
 type = "command"
 run = "cargo make on-add"

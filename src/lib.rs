@@ -5,5 +5,6 @@ pub mod hooks;
 pub mod layout;
 pub mod path_display;
 pub mod picker;
+pub mod pr_cache;
 pub mod shell_init;
 pub mod vcs;

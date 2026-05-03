@@ -61,7 +61,12 @@ enum Command {
 
     /// List existing worktrees / workspaces.
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Bypass the PR cache and re-fetch from GitHub. No effect unless
+        /// `[ui] show_pr = true` in renri.toml.
+        #[arg(long)]
+        refresh: bool,
+    },
 
     /// Remove a worktree / forget a workspace.
     #[command(alias = "rm")]
@@ -151,7 +156,7 @@ fn main() -> Result<()> {
     let non_interactive = cli.non_interactive;
 
     match cli.command {
-        Command::List => cmd_list(choice),
+        Command::List { refresh } => cmd_list(choice, refresh),
         Command::Config {
             sub: ConfigCommand::Show,
         } => cmd_config_show(choice),
@@ -181,8 +186,9 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_list(choice: vcs::VcsChoice) -> Result<()> {
+fn cmd_list(choice: vcs::VcsChoice, refresh: bool) -> Result<()> {
     use owo_colors::OwoColorize;
+    use renri::pr_cache;
 
     let opened = open_repo_backend(choice)?;
     let worktrees = opened.backend.list()?;
@@ -190,7 +196,45 @@ fn cmd_list(choice: vcs::VcsChoice) -> Result<()> {
         return Ok(());
     }
 
-    let rows: Vec<ListRow> = worktrees.iter().map(ListRow::from).collect();
+    // Pull `[ui]` config so we know whether to add the PR column. The PR
+    // cache is GitHub-only and fully optional; failures here downgrade to
+    // an empty map rather than aborting the whole list.
+    let loaded = config::Config::load(Some(&opened.repo.root)).unwrap_or_default();
+    let show_pr = loaded.config.ui.show_pr;
+    let prs = if show_pr {
+        let branch = opened
+            .backend
+            .current_branch()
+            .unwrap_or_else(|| "main".into());
+        let vcs_ctx =
+            layout::discover_vcs_context(opened.backend.as_ref(), &opened.repo.root, &branch);
+        pr_cache::load_or_refresh(
+            &vcs_ctx.owner,
+            &vcs_ctx.repo,
+            vcs_ctx.host.as_deref(),
+            loaded.config.ui.pr_cache_ttl_hours,
+            refresh,
+        )
+    } else {
+        Default::default()
+    };
+
+    let rows: Vec<ListRow> = worktrees
+        .iter()
+        .map(|w| {
+            let mut r = ListRow::from(w);
+            if show_pr {
+                if let Some(branch) = w.branch.as_deref() {
+                    if let Some(pr) = prs.get(branch) {
+                        r.pr = Some(format!("#{}", pr.number));
+                        r.pr_state = Some(pr.state.clone());
+                    }
+                }
+            }
+            r
+        })
+        .collect();
+
     // `chars().count()` so multi-byte names align correctly. Doesn't account
     // for east-asian wide characters; that's a follow-up if it bites.
     let name_w = rows
@@ -199,15 +243,34 @@ fn cmd_list(choice: vcs::VcsChoice) -> Result<()> {
         .max()
         .unwrap_or(0)
         .max(4);
+    let pr_w = if show_pr {
+        rows.iter()
+            .map(|r| r.pr.as_deref().map_or(0, |s| s.chars().count()))
+            .max()
+            .unwrap_or(0)
+            .max(2)
+    } else {
+        0
+    };
 
     // Header on stdout so the whole table is on one stream — piping or
     // redirecting `renri list` keeps the column legend.
-    println!(
-        "  {name:name_w$}  {st}  {desc}",
-        name = "NAME".dimmed(),
-        st = "ST".dimmed(),
-        desc = "DESCRIPTION".dimmed(),
-    );
+    if show_pr {
+        println!(
+            "  {name:name_w$}  {st}  {pr:pr_w$}  {desc}",
+            name = "NAME".dimmed(),
+            st = "ST".dimmed(),
+            pr = "PR".dimmed(),
+            desc = "DESCRIPTION".dimmed(),
+        );
+    } else {
+        println!(
+            "  {name:name_w$}  {st}  {desc}",
+            name = "NAME".dimmed(),
+            st = "ST".dimmed(),
+            desc = "DESCRIPTION".dimmed(),
+        );
+    }
 
     for row in &rows {
         // Leading marker: highlights the *role* of the row (main / stale).
@@ -251,7 +314,22 @@ fn cmd_list(choice: vcs::VcsChoice) -> Result<()> {
         };
 
         let name_pad = " ".repeat(name_w.saturating_sub(row.name.chars().count()));
-        println!("{marker} {name}{name_pad}  {status}   {desc}");
+
+        if show_pr {
+            // PR cell: number colored by state, dim placeholder when absent.
+            let pr_cell = match (row.pr.as_deref(), row.pr_state.as_deref()) {
+                (Some(n), Some("OPEN")) => n.green().to_string(),
+                (Some(n), Some("MERGED")) => n.dimmed().to_string(),
+                (Some(n), Some("CLOSED")) => n.red().dimmed().to_string(),
+                (Some(n), _) => n.to_string(),
+                _ => "—".dimmed().to_string(),
+            };
+            let pr_raw_len = row.pr.as_deref().map_or(1, |s| s.chars().count());
+            let pr_pad = " ".repeat(pr_w.saturating_sub(pr_raw_len));
+            println!("{marker} {name}{name_pad}  {status}   {pr_cell}{pr_pad}  {desc}");
+        } else {
+            println!("{marker} {name}{name_pad}  {status}   {desc}");
+        }
     }
     Ok(())
 }
@@ -263,6 +341,8 @@ struct ListRow {
     stale: bool,
     dirty: bool,
     conflict: bool,
+    pr: Option<String>,
+    pr_state: Option<String>,
 }
 
 impl From<&vcs::Worktree> for ListRow {
@@ -274,6 +354,8 @@ impl From<&vcs::Worktree> for ListRow {
             stale: w.is_stale,
             dirty: w.dirty,
             conflict: w.conflict,
+            pr: None,
+            pr_state: None,
         }
     }
 }

@@ -23,6 +23,36 @@ pub struct Config {
 
     #[serde(default)]
     pub hooks: HooksConfig,
+
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UiConfig {
+    /// When true, `renri list` adds a PR column populated from
+    /// GitHub via `gh pr list`. Cached on disk; refreshed lazily once
+    /// `pr_cache_ttl_hours` has elapsed.
+    #[serde(default)]
+    pub show_pr: bool,
+
+    /// Hours before the PR cache is considered stale and refreshed on
+    /// the next `renri list`. Defaults to 24.
+    #[serde(default = "default_pr_cache_ttl_hours")]
+    pub pr_cache_ttl_hours: u64,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            show_pr: false,
+            pr_cache_ttl_hours: default_pr_cache_ttl_hours(),
+        }
+    }
+}
+
+fn default_pr_cache_ttl_hours() -> u64 {
+    24
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
