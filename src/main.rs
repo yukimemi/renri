@@ -296,6 +296,18 @@ fn cmd_add(choice: vcs::VcsChoice, name: Option<String>, non_interactive: bool) 
         );
     }
 
+    // Both `git worktree add` and `jj workspace add` require the parent
+    // directory to exist; neither creates intermediate directories. Without
+    // this, a fresh user with no `~/wt/<owner>/<repo>/` would see a confusing
+    // OS-level "path not found" error instead of a clean creation.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("creating worktree-parent directory {}", parent.display())
+            })?;
+        }
+    }
+
     let strategy = if opened.backend.branch_exists(&name) {
         tracing::info!(branch = %name, "attaching to existing branch");
         vcs::AddBranch::ExistingBranch(&name)
