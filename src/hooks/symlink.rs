@@ -4,7 +4,9 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+#[cfg(any(windows, not(any(unix, windows))))]
+use anyhow::bail;
+use anyhow::{Context, Result};
 
 pub fn create(target: &Path, link: &Path) -> Result<()> {
     if let Some(parent) = link.parent() {
