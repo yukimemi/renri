@@ -57,6 +57,74 @@ impl JjBackend {
         }
     }
 
+    /// Resolve a revset and return the result's short change_id, or `None`
+    /// if the revset is empty / jj fails.
+    fn resolve_rev(&self, revset: &str) -> Option<String> {
+        let output = self
+            .jj()
+            .args([
+                "log",
+                "-r",
+                revset,
+                "--no-graph",
+                "-T",
+                "self.change_id().short()",
+                "--limit",
+                "1",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
+
+    /// True if the commit at `<rev>` has no diff vs its parent (jj's
+    /// per-workspace WC placeholder is the typical case).
+    fn is_empty(&self, rev: &str) -> bool {
+        let output = self
+            .jj()
+            .args([
+                "log",
+                "-r",
+                rev,
+                "--no-graph",
+                "-T",
+                "if(self.empty(), \"1\", \"0\")",
+                "--limit",
+                "1",
+            ])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "1",
+            _ => false,
+        }
+    }
+
+    /// Pick the base for a `NewBranch` add. Heuristic, applied only when the
+    /// user didn't pin one with `--from`:
+    ///
+    /// 1. If cwd's `@` has actual content (non-empty), respect it — the
+    ///    user is forking off in-progress work and wants those changes.
+    /// 2. Otherwise (`@` is jj's per-workspace empty WC placeholder), use
+    ///    `trunk()` — jj's configured trunk revset, typically
+    ///    `main@origin` / `master@origin`. Pushing the new branch then
+    ///    doesn't drag the empty placeholder along as an intermediate
+    ///    parent in the git history.
+    /// 3. Final fallback: leave it as `@`, same as before this fix.
+    fn default_new_branch_base(&self, user_input: &str) -> String {
+        if user_input != "@" {
+            return user_input.to_string();
+        }
+        if !self.is_empty("@") {
+            return "@".to_string();
+        }
+        self.resolve_rev("trunk()")
+            .unwrap_or_else(|| "@".to_string())
+    }
+
     /// Look up the @-commit's short change id, bookmark list, description
     /// first line, and dirty / conflict flags in a single `jj log` call.
     fn workspace_status(&self, name: &str) -> Option<JjStatus> {
@@ -200,9 +268,25 @@ impl Backend for JjBackend {
         //
         // The git backend reaches the same outcome via
         // `git worktree add -b <new> <path> [<base>]`.
-        let (workspace_name, base_rev) = match branch {
+        let (workspace_name, base_rev_input) = match branch {
             AddBranch::NewBranch { name, base } => (name, base.unwrap_or("@")),
             AddBranch::ExistingBranch(name) => (name, name),
+        };
+
+        // For NewBranch with no explicit `--from`, prefer `trunk()` over
+        // an empty `@` so the new workspace doesn't inherit jj's
+        // per-workspace empty WC placeholder as its parent. See
+        // `default_new_branch_base` for the heuristic.
+        //
+        // ExistingBranch is taken verbatim — `--name <bookmark>` means
+        // "attach to this exact bookmark", even if its commit is empty.
+        let resolved;
+        let base_rev: &str = match branch {
+            AddBranch::NewBranch { .. } => {
+                resolved = self.default_new_branch_base(base_rev_input);
+                resolved.as_str()
+            }
+            AddBranch::ExistingBranch(_) => base_rev_input,
         };
 
         let status = self
