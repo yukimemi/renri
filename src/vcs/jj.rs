@@ -33,22 +33,91 @@ impl JjBackend {
         cmd
     }
 
-    fn workspace_root(&self, name: &str) -> Option<PathBuf> {
+    /// Look up the on-disk root of a workspace.
+    ///
+    /// `Err`        — couldn't even spawn `jj` (binary missing, fs error). Bubble up.
+    /// `Ok(None)`   — `jj` ran but couldn't locate the workspace root. The
+    ///                workspace is genuinely stale (its directory has been
+    ///                removed out from under jj).
+    /// `Ok(Some(p))` — current root path.
+    fn workspace_root(&self, name: &str) -> Result<Option<PathBuf>> {
         let output = self
             .jj()
             .args(["workspace", "root", "--name", name])
+            .output()
+            .context("failed to spawn `jj`")?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(PathBuf::from(s)))
+        }
+    }
+
+    /// Look up the @-commit's short change id, bookmark list, description
+    /// first line, and dirty / conflict flags in a single `jj log` call.
+    fn workspace_status(&self, name: &str) -> Option<JjStatus> {
+        // Sentinel \x1f (ASCII unit separator) keeps fields apart even if
+        // descriptions contain tabs or commas. Order: id, bookmarks, dirty
+        // ("1" = non-empty @ = WC has changes), conflict, desc.
+        let template = "self.change_id().short() ++ \"\\x1f\" \
+                        ++ self.bookmarks().map(|b| b.name()).join(\",\") ++ \"\\x1f\" \
+                        ++ if(self.empty(), \"0\", \"1\") ++ \"\\x1f\" \
+                        ++ if(self.conflict(), \"1\", \"0\") ++ \"\\x1f\" \
+                        ++ self.description().first_line()";
+        let output = self
+            .jj()
+            .args([
+                "log",
+                "-r",
+                &format!("{name}@"),
+                "--no-graph",
+                "-T",
+                template,
+            ])
             .output()
             .ok()?;
         if !output.status.success() {
             return None;
         }
-        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if s.is_empty() {
+        let s = String::from_utf8_lossy(&output.stdout);
+        let mut parts = s.splitn(5, '\x1f');
+        let id = parts.next()?.trim().to_string();
+        let bookmarks = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let dirty = parts.next().map(str::trim) == Some("1");
+        let conflict = parts.next().map(str::trim) == Some("1");
+        let desc = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        if id.is_empty() {
             None
         } else {
-            Some(PathBuf::from(s))
+            Some(JjStatus {
+                id,
+                bookmarks,
+                dirty,
+                conflict,
+                desc,
+            })
         }
     }
+}
+
+struct JjStatus {
+    id: String,
+    bookmarks: Option<String>,
+    dirty: bool,
+    conflict: bool,
+    desc: Option<String>,
 }
 
 impl Backend for JjBackend {
@@ -82,17 +151,36 @@ impl Backend for JjBackend {
                 continue;
             };
             let name = name.trim().to_string();
-            let path = self
-                .workspace_root(&name)
-                .unwrap_or_else(|| self.root.clone());
+
+            // `workspace_root` returns `Ok(None)` when jj ran cleanly but
+            // couldn't locate the workspace's directory (stale). Spawn errors
+            // / IO errors propagate via `?` so we don't conflate them with
+            // genuine staleness.
+            let (path, is_stale) = match self.workspace_root(&name)? {
+                Some(p) => (p, false),
+                None => (PathBuf::new(), true),
+            };
+
+            let (head, branch, desc, dirty, conflict) = if is_stale {
+                (None, None, None, false, false)
+            } else {
+                match self.workspace_status(&name) {
+                    Some(st) => (Some(st.id), st.bookmarks, st.desc, st.dirty, st.conflict),
+                    None => (None, None, None, false, false),
+                }
+            };
+
             wts.push(Worktree {
                 name: name.clone(),
                 path,
-                branch: None, // bookmark lookup deferred — surfaced via current_branch
-                head: None,
+                branch,
+                head,
+                desc,
+                dirty,
+                conflict,
                 is_main: name == "default",
                 is_bare: false,
-                is_stale: false,
+                is_stale,
                 is_locked: false,
             });
         }
@@ -273,15 +361,21 @@ impl Backend for JjBackend {
             if wt.is_main {
                 continue;
             }
-            if !wt.path.exists() {
-                let status = self
-                    .jj()
-                    .args(["workspace", "forget", &wt.name])
-                    .status()
-                    .context("failed to spawn `jj`")?;
-                if status.success() {
-                    forgotten.push(wt.name);
-                }
+            // Forget when either:
+            //   - jj already considers it stale (workspace_root failed → on-disk
+            //     dir is gone or jj's metadata can't resolve it), or
+            //   - the path resolves but the directory was rm-rf'd manually.
+            let needs_forget = wt.is_stale || !wt.path.as_os_str().is_empty() && !wt.path.exists();
+            if !needs_forget {
+                continue;
+            }
+            let status = self
+                .jj()
+                .args(["workspace", "forget", &wt.name])
+                .status()
+                .context("failed to spawn `jj`")?;
+            if status.success() {
+                forgotten.push(wt.name);
             }
         }
         if forgotten.is_empty() {

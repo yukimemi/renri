@@ -150,46 +150,100 @@ fn main() -> Result<()> {
 }
 
 fn cmd_list(choice: vcs::VcsChoice) -> Result<()> {
-    let opened = open_repo_backend(choice)?;
-    let backend = opened.backend;
+    use owo_colors::OwoColorize;
 
-    let worktrees = backend.list()?;
+    let opened = open_repo_backend(choice)?;
+    let worktrees = opened.backend.list()?;
     if worktrees.is_empty() {
         return Ok(());
     }
 
-    let name_w = worktrees.iter().map(|w| w.name.len()).max().unwrap_or(0);
-    let path_w = worktrees
+    let rows: Vec<ListRow> = worktrees.iter().map(ListRow::from).collect();
+    // `chars().count()` so multi-byte names align correctly. Doesn't account
+    // for east-asian wide characters; that's a follow-up if it bites.
+    let name_w = rows
         .iter()
-        .map(|w| w.path.display().to_string().len())
+        .map(|r| r.name.chars().count())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(4);
 
-    for w in &worktrees {
-        let marker = if w.is_main { "*" } else { " " };
-        let branch = w.branch.as_deref().unwrap_or("(detached)");
-        let mut flags = Vec::new();
-        if w.is_bare {
-            flags.push("bare");
-        }
-        if w.is_locked {
-            flags.push("locked");
-        }
-        if w.is_stale {
-            flags.push("stale");
-        }
-        let suffix = if flags.is_empty() {
-            String::new()
+    // Header on stdout so the whole table is on one stream — piping or
+    // redirecting `renri list` keeps the column legend.
+    println!(
+        "  {name:name_w$}  {st}  {desc}",
+        name = "NAME".dimmed(),
+        st = "ST".dimmed(),
+        desc = "DESCRIPTION".dimmed(),
+    );
+
+    for row in &rows {
+        // Leading marker: highlights the *role* of the row (main / stale).
+        let marker = if row.stale {
+            "⚠".yellow().to_string()
+        } else if row.main {
+            "★".green().to_string()
         } else {
-            format!(" [{}]", flags.join(","))
+            " ".to_string()
         };
-        println!(
-            "{marker} {name:name_w$}  {path:path_w$}  {branch}{suffix}",
-            name = w.name,
-            path = w.path.display(),
-        );
+
+        let name = if row.main {
+            row.name.green().bold().to_string()
+        } else if row.stale {
+            row.name.yellow().to_string()
+        } else {
+            row.name.clone()
+        };
+
+        // STATUS icon: state of the working copy.
+        //   ✓ clean (no WC changes)
+        //   ● has uncommitted changes
+        //   ‼ conflict — outranks dirty
+        //   ⋯ stale / unknown
+        let status = if row.stale {
+            "⋯".dimmed().to_string()
+        } else if row.conflict {
+            "‼".red().bold().to_string()
+        } else if row.dirty {
+            "●".yellow().to_string()
+        } else {
+            "✓".green().to_string()
+        };
+
+        let desc = if row.stale {
+            "(stale — directory missing)".yellow().italic().to_string()
+        } else if row.desc.is_empty() {
+            "(no description)".dimmed().italic().to_string()
+        } else {
+            row.desc.clone()
+        };
+
+        let name_pad = " ".repeat(name_w.saturating_sub(row.name.chars().count()));
+        println!("{marker} {name}{name_pad}  {status}   {desc}");
     }
     Ok(())
+}
+
+struct ListRow {
+    name: String,
+    desc: String,
+    main: bool,
+    stale: bool,
+    dirty: bool,
+    conflict: bool,
+}
+
+impl From<&vcs::Worktree> for ListRow {
+    fn from(w: &vcs::Worktree) -> Self {
+        Self {
+            name: w.name.clone(),
+            desc: w.desc.clone().unwrap_or_default(),
+            main: w.is_main,
+            stale: w.is_stale,
+            dirty: w.dirty,
+            conflict: w.conflict,
+        }
+    }
 }
 
 struct OpenedRepo {
