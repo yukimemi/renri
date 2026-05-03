@@ -44,6 +44,19 @@ enum Command {
     Add {
         /// Branch / bookmark name. If omitted, prompt interactively.
         name: Option<String>,
+
+        /// Fork the new branch off this revision instead of the cwd
+        /// worktree's current HEAD. Accepts whatever the backend
+        /// understands: a commit hash, branch / bookmark name, tag, or
+        /// (for jj) a revset like `@-`. Pass the flag without a value
+        /// to open a fuzzy picker over local refs.
+        #[arg(
+            long,
+            value_name = "REF",
+            num_args = 0..=1,
+            default_missing_value = ""
+        )]
+        from: Option<String>,
     },
 
     /// List existing worktrees / workspaces.
@@ -123,7 +136,7 @@ fn main() -> Result<()> {
         Command::Config {
             sub: ConfigCommand::Show,
         } => cmd_config_show(choice),
-        Command::Add { name } => cmd_add(choice, name, non_interactive),
+        Command::Add { name, from } => cmd_add(choice, name, from, non_interactive),
         Command::Remove { name } => cmd_remove(choice, name, non_interactive),
         Command::Cd { name } => cmd_cd(choice, name, non_interactive),
         Command::Exec { name, argv } => cmd_exec(choice, name, argv, non_interactive),
@@ -263,7 +276,17 @@ fn cmd_config_show(choice: vcs::VcsChoice) -> Result<()> {
     Ok(())
 }
 
-fn cmd_add(choice: vcs::VcsChoice, name: Option<String>, non_interactive: bool) -> Result<()> {
+fn cmd_add(
+    choice: vcs::VcsChoice,
+    name: Option<String>,
+    from: Option<String>,
+    non_interactive: bool,
+) -> Result<()> {
+    // Trim the user-supplied `--from`. An empty string after trim is the
+    // signal for "open the picker" (clap's `default_missing_value = ""`),
+    // so preserve `Some("")` here instead of filtering it out.
+    let from = from.map(|s| s.trim().to_string());
+
     let name = match name {
         Some(n) => n.trim().to_string(),
         None => prompt_branch_name(non_interactive)?,
@@ -319,12 +342,33 @@ fn cmd_add(choice: vcs::VcsChoice, name: Option<String>, non_interactive: bool) 
         }
     }
 
+    // Resolve `--from` semantics:
+    //   None       → no flag passed → fork off cwd HEAD (default)
+    //   Some("")   → flag passed without value → open fuzzy picker
+    //   Some(ref)  → use ref as-is
+    let from_resolved = match from.as_deref() {
+        None => None,
+        Some("") => Some(prompt_base_ref(opened.backend.as_ref(), non_interactive)?),
+        Some(ref_str) => Some(ref_str.to_string()),
+    };
+
     let strategy = if opened.backend.branch_exists(&name) {
+        if from_resolved.is_some() {
+            tracing::warn!(
+                branch = %name,
+                "--from is ignored when attaching to an existing branch"
+            );
+        }
         tracing::info!(branch = %name, "attaching to existing branch");
         vcs::AddBranch::ExistingBranch(&name)
     } else {
-        tracing::info!(branch = %name, "creating new branch off HEAD");
-        vcs::AddBranch::NewBranch(&name)
+        let base = from_resolved.as_deref();
+        tracing::info!(
+            branch = %name,
+            base = base.unwrap_or("(cwd HEAD)"),
+            "creating new branch"
+        );
+        vcs::AddBranch::NewBranch { name: &name, base }
     };
 
     println!("creating worktree at {}", path.display());
@@ -501,4 +545,20 @@ fn prompt_branch_name(non_interactive: bool) -> Result<String> {
         .prompt()
         .context("interactive prompt cancelled")?;
     Ok(answer.trim().to_string())
+}
+
+fn prompt_base_ref(backend: &dyn vcs::Backend, non_interactive: bool) -> Result<String> {
+    if non_interactive {
+        anyhow::bail!("--non-interactive set and `--from` had no value");
+    }
+    let refs = backend.list_refs()?;
+    if refs.is_empty() {
+        anyhow::bail!(
+            "no branches / bookmarks / tags found to pick from; pass an explicit `--from <REF>`"
+        );
+    }
+    let picked = inquire::Select::new("base ref for the new branch?", refs)
+        .prompt()
+        .context("interactive pick cancelled")?;
+    Ok(picked)
 }

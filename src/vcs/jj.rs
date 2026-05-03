@@ -101,15 +101,27 @@ impl Backend for JjBackend {
     }
 
     fn add(&self, path: &Path, branch: AddBranch) -> Result<()> {
-        let bookmark = match branch {
-            AddBranch::NewBranch(b) | AddBranch::ExistingBranch(b) => b,
+        // jj's `workspace add` defaults the base revision to the **default**
+        // workspace's @, ignoring the cwd workspace. That surprises users
+        // who run `renri add` from a secondary workspace expecting to fork
+        // off their work-in-progress. We pass `-r` explicitly:
+        //
+        //   NewBranch + base=None      → fork off cwd workspace's @
+        //   NewBranch + base=Some(ref) → fork off <ref>
+        //   ExistingBranch(name)       → fork off <name> (the bookmark's tip)
+        //
+        // The git backend reaches the same outcome via
+        // `git worktree add -b <new> <path> [<base>]`.
+        let (workspace_name, base_rev) = match branch {
+            AddBranch::NewBranch { name, base } => (name, base.unwrap_or("@")),
+            AddBranch::ExistingBranch(name) => (name, name),
         };
 
         let status = self
             .jj()
-            .args(["workspace", "add"])
+            .args(["workspace", "add", "-r", base_rev])
             .arg(path)
-            .args(["--name", bookmark])
+            .args(["--name", workspace_name])
             .status()
             .context("failed to spawn `jj`")?;
         if !status.success() {
@@ -117,25 +129,38 @@ impl Backend for JjBackend {
         }
 
         // Position the new workspace's working copy and attach the bookmark.
+        // The first `jj workspace add` ran in `self.root` and resolved a
+        // relative `path` against that. The follow-up has its own
+        // `current_dir`, which `std::process::Command` treats as relative
+        // to the parent process's CWD — different base. Absolutize against
+        // `self.root` so the two invocations always agree.
+        let abs_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
         let mut cmd = Command::new("jj");
-        cmd.current_dir(path);
+        cmd.current_dir(&abs_path);
         match branch {
-            AddBranch::NewBranch(b) => {
+            AddBranch::NewBranch { name, .. } => {
                 let status = cmd
-                    .args(["bookmark", "create", b])
+                    .args(["bookmark", "create", name])
                     .status()
                     .context("failed to spawn `jj`")?;
                 if !status.success() {
                     bail!("jj bookmark create failed");
                 }
             }
-            AddBranch::ExistingBranch(b) => {
+            AddBranch::ExistingBranch(name) => {
+                // Already created at `name`'s tip via `-r`; explicit `edit`
+                // ensures the workspace's @ tracks the bookmark even if jj
+                // updates the semantics in the future.
                 let status = cmd
-                    .args(["edit", b])
+                    .args(["edit", name])
                     .status()
                     .context("failed to spawn `jj`")?;
                 if !status.success() {
-                    bail!("jj edit {b} failed");
+                    bail!("jj edit {name} failed");
                 }
             }
         }
@@ -213,6 +238,25 @@ impl Backend for JjBackend {
         }
         let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if s.is_empty() { None } else { Some(s) }
+    }
+
+    fn list_refs(&self) -> Result<Vec<String>> {
+        let output = self
+            .jj()
+            .args(["bookmark", "list", "-T", "self.name() ++ \"\\n\""])
+            .output()
+            .context("failed to spawn `jj`")?;
+        if !output.status.success() {
+            bail!(
+                "jj bookmark list: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect())
     }
 
     fn branch_exists(&self, name: &str) -> bool {
