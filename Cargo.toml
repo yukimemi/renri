@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "development-tools"]
 keywords = ["git", "worktree", "jujutsu", "jj", "workspace"]
 
 [dependencies]
-teravars = { version = "0.1", features = ["merge"] }
+teravars = { version = "0.1.4", features = ["merge"] }
 clap = { version = "4", features = ["derive"] }
 inquire = "0.7"
 serde = { version = "1", features = ["derive"] }
