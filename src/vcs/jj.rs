@@ -387,4 +387,27 @@ impl Backend for JjBackend {
             ))
         }
     }
+
+    fn fetch(&self) -> Result<String> {
+        let output = self
+            .jj()
+            .args(["git", "fetch"])
+            .output()
+            .context("failed to spawn `jj`")?;
+        if !output.status.success() {
+            bail!(
+                "jj git fetch: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        // jj git fetch is mostly silent; show whichever of stderr/stdout had
+        // content so the user gets feedback when bookmarks moved.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stderr.trim().is_empty() {
+            Ok(stderr.into_owned())
+        } else {
+            Ok(stdout.into_owned())
+        }
+    }
 }

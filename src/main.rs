@@ -3,10 +3,10 @@
 //! See ROADMAP.md for the design and the staged work plan.
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use teravars::{Engine, system_context};
 
-use renri::{config, hooks, layout, picker, shell_init, vcs};
+use renri::{config, hooks, layout, path_display::display_path, picker, shell_init, vcs};
 
 #[derive(Parser, Debug)]
 #[command(name = "renri", version, about, long_about = None)]
@@ -116,6 +116,18 @@ enum Command {
         #[command(subcommand)]
         sub: ConfigCommand,
     },
+
+    /// Run `git fetch origin` / `jj git fetch` in the current repo so all
+    /// worktrees see the latest remote refs.
+    Sync,
+
+    /// Print a shell-completion script for the given shell. Pipe into your
+    /// shell's completion-loader, e.g.
+    /// `renri completions bash > ~/.local/share/bash-completion/completions/renri`.
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -152,11 +164,18 @@ fn main() -> Result<()> {
         Command::ShellInit { shell, install } => {
             if install {
                 let target = shell_init::install(shell)?;
-                println!("renri shell wrapper installed → {}", target.display());
+                println!("renri shell wrapper installed → {}", display_path(&target));
                 println!("restart your shell (or `source` the file) to activate.");
             } else {
                 print!("{}", shell_init::snippet(shell));
             }
+            Ok(())
+        }
+        Command::Sync => cmd_sync(choice),
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let bin = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, bin, &mut std::io::stdout());
             Ok(())
         }
     }
@@ -273,18 +292,22 @@ fn open_repo_backend(choice: vcs::VcsChoice) -> Result<OpenedRepo> {
 }
 
 fn cmd_config_show(choice: vcs::VcsChoice) -> Result<()> {
+    use owo_colors::OwoColorize;
+
     let opened = open_repo_backend(choice)?;
     let mut engine = Engine::new();
 
     let loaded = config::Config::load_with_engine(Some(&opened.repo.root), &mut engine)?;
 
-    let branch = opened
-        .backend
-        .current_branch()
-        .unwrap_or_else(|| "(none)".into());
-    let vcs_ctx = layout::discover_vcs_context(opened.backend.as_ref(), &opened.repo.root, &branch);
+    let branch_opt = opened.backend.current_branch();
+    // The placeholder we hand the layout renderer when there's no current
+    // branch. Renders as `…/(none)` in the resolved path, which we suppress
+    // below since the path isn't meaningful without a real branch.
+    let branch_display = branch_opt.clone().unwrap_or_else(|| "(none)".into());
+    let vcs_ctx =
+        layout::discover_vcs_context(opened.backend.as_ref(), &opened.repo.root, &branch_display);
 
-    let path = layout::render_path(
+    let resolved_path = layout::render_path(
         &mut engine,
         &system_context(),
         &vcs_ctx,
@@ -292,52 +315,69 @@ fn cmd_config_show(choice: vcs::VcsChoice) -> Result<()> {
         loaded.config.layout.worktree_path.as_deref(),
     )?;
 
-    println!("backend:           {}", opened.backend.name());
-    println!("repo root:         {}", opened.repo.root.display());
-    print!("vcs.host:          ");
-    match vcs_ctx.host.as_deref() {
-        Some(h) => println!("{h}"),
-        None => println!("(none)"),
+    let worktree_root = loaded
+        .config
+        .layout
+        .worktree_root
+        .as_deref()
+        .unwrap_or(layout::DEFAULT_WORKTREE_ROOT);
+    let worktree_path_tmpl = loaded
+        .config
+        .layout
+        .worktree_path
+        .as_deref()
+        .unwrap_or(layout::DEFAULT_WORKTREE_PATH);
+
+    println!("{}", "repo".dimmed());
+    println!("  backend:           {}", opened.backend.name());
+    println!("  root:              {}", display_path(&opened.repo.root));
+
+    println!();
+    println!("{}", "vcs context".dimmed());
+    println!(
+        "  host:              {}",
+        vcs_ctx.host.as_deref().unwrap_or("(none)")
+    );
+    println!("  owner:             {}", vcs_ctx.owner);
+    println!("  repo:              {}", vcs_ctx.repo);
+    match branch_opt.as_deref() {
+        Some(b) => println!("  branch:            {b}"),
+        None => println!("  branch:            {}", "(no bookmark at @)".dimmed()),
     }
-    println!("vcs.owner:         {}", vcs_ctx.owner);
-    println!("vcs.repo:          {}", vcs_ctx.repo);
-    println!("vcs.branch:        {}", vcs_ctx.branch);
+
     println!();
-    println!(
-        "worktree_root:     {}",
-        loaded
-            .config
-            .layout
-            .worktree_root
-            .as_deref()
-            .unwrap_or(layout::DEFAULT_WORKTREE_ROOT)
-    );
-    println!(
-        "worktree_path:     {}",
-        loaded
-            .config
-            .layout
-            .worktree_path
-            .as_deref()
-            .unwrap_or(layout::DEFAULT_WORKTREE_PATH)
-    );
-    println!("→ resolved path:   {}", path.display());
+    println!("{}", "layout (template)".dimmed());
+    println!("  worktree_root:     {worktree_root}");
+    println!("  worktree_path:     {worktree_path_tmpl}");
+
+    if branch_opt.is_some() {
+        println!();
+        println!("{}", "layout (resolved for current branch)".dimmed());
+        println!("  → {}", display_path(&resolved_path));
+    }
+
     println!();
+    println!("{}", "hooks".dimmed());
     println!(
-        "post_create hooks: {}",
+        "  post_create:       {}",
         loaded.config.hooks.post_create.len()
     );
     println!(
-        "pre_remove hooks:  {}",
+        "  pre_remove:        {}",
         loaded.config.hooks.pre_remove.len()
     );
+
     println!();
     if loaded.sources.is_empty() {
-        println!("config sources:    (none — using built-in defaults)");
+        println!(
+            "{}        {}",
+            "config sources".dimmed(),
+            "(none — using built-in defaults)".dimmed()
+        );
     } else {
-        println!("config sources:");
+        println!("{}", "config sources".dimmed());
         for s in &loaded.sources {
-            println!("  - {}", s.display());
+            println!("  {}", display_path(s));
         }
     }
     Ok(())
@@ -438,7 +478,7 @@ fn cmd_add(
         vcs::AddBranch::NewBranch { name: &name, base }
     };
 
-    println!("creating worktree at {}", path.display());
+    println!("creating worktree at {}", display_path(&path));
     opened.backend.add(&path, strategy)?;
 
     let post = &loaded.config.hooks.post_create;
@@ -454,7 +494,7 @@ fn cmd_add(
         hooks::run_all(post, &mut hr)?;
     }
 
-    println!("done. {}", path.display());
+    println!("done. {}", display_path(&path));
     Ok(())
 }
 
@@ -470,7 +510,7 @@ fn cmd_cd(choice: vcs::VcsChoice, name: Option<String>, non_interactive: bool) -
     //      Windows) with cwd = worktree path, so plain `renri cd <name>`
     //      Just Works without rc-file setup. The user `exit`s to come back.
     if std::env::var_os("RENRI_SHELL_WRAPPER").is_some() {
-        println!("{}", picked.path.display());
+        println!("{}", display_path(&picked.path));
         return Ok(());
     }
 
@@ -485,7 +525,7 @@ fn spawn_subshell_in(path: &std::path::Path) -> Result<()> {
          renri:       eval \"$(renri shell-init bash)\"        # or zsh / fish / powershell\n\
          renri:       (or `renri shell-init --install bash` to write it to your rc file)",
         shell = shell,
-        path = path.display(),
+        path = display_path(path),
     );
     let status = std::process::Command::new(&shell)
         .current_dir(path)
@@ -538,7 +578,7 @@ fn cmd_remove(choice: vcs::VcsChoice, name: Option<String>, non_interactive: boo
         hooks::run_all(pre, &mut hr)?;
     }
 
-    println!("removing {}", picked.path.display());
+    println!("removing {}", display_path(&picked.path));
     opened.backend.remove(&picked.path, false)?;
     Ok(())
 }
@@ -582,7 +622,7 @@ fn cmd_init(force: bool) -> Result<()> {
 
     std::fs::write(&target, INIT_TEMPLATE)
         .with_context(|| format!("writing {}", target.display()))?;
-    println!("wrote {}", target.display());
+    println!("wrote {}", display_path(&target));
     Ok(())
 }
 
@@ -596,6 +636,18 @@ fn cmd_prune(choice: vcs::VcsChoice) -> Result<()> {
     let trimmed = output.trim();
     if trimmed.is_empty() {
         println!("nothing to prune");
+    } else {
+        println!("{trimmed}");
+    }
+    Ok(())
+}
+
+fn cmd_sync(choice: vcs::VcsChoice) -> Result<()> {
+    let opened = open_repo_backend(choice)?;
+    let output = opened.backend.fetch()?;
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        println!("fetched (nothing changed)");
     } else {
         println!("{trimmed}");
     }

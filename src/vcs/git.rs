@@ -181,6 +181,22 @@ impl Backend for GitBackend {
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
+
+    fn fetch(&self) -> Result<String> {
+        let output = self
+            .git()
+            .args(["fetch", "origin"])
+            .output()
+            .context("failed to spawn `git`")?;
+        if !output.status.success() {
+            bail!(
+                "git fetch origin: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        // git prints fetch progress / "From origin" lines on stderr.
+        Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
 }
 
 /// Parse the output of `git worktree list --porcelain`.

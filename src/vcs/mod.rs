@@ -107,6 +107,13 @@ pub trait Backend {
     fn prune(&self) -> Result<String> {
         Ok(String::new())
     }
+
+    /// Update remote refs from origin. `git fetch origin` for git,
+    /// `jj git fetch` for jj. Repo-wide — all worktrees see the new refs
+    /// since they share the same git store.
+    fn fetch(&self) -> Result<String> {
+        Ok(String::new())
+    }
 }
 
 /// Pick which backend to use given the detected repo kind and the user's
