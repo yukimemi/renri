@@ -8,12 +8,10 @@ use teravars::{Context as TeraCtx, Engine};
 
 use crate::vcs::Backend;
 
-/// Default location of the worktree tree.
-#[cfg(windows)]
-pub const DEFAULT_WORKTREE_ROOT: &str = "{{ env(name='USERPROFILE') }}/wt";
-
-#[cfg(not(windows))]
-pub const DEFAULT_WORKTREE_ROOT: &str = "{{ env(name='HOME') }}/wt";
+/// Default root directory for new worktrees. Cross-platform via teravars'
+/// `home()` helper — wraps `dirs::home_dir()` so we don't have to care
+/// whether the user is on a Windows shell that exports HOME or not.
+pub const DEFAULT_WORKTREE_ROOT: &str = "{{ home() }}/wt";
 
 /// Default sub-path under the worktree root.
 pub const DEFAULT_WORKTREE_PATH: &str =
