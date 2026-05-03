@@ -43,8 +43,14 @@ pub struct Worktree {
 /// How a worktree should be hooked up to a branch when adding it.
 #[derive(Debug, Clone, Copy)]
 pub enum AddBranch<'a> {
-    /// Create a new branch with this name off the current HEAD.
-    NewBranch(&'a str),
+    /// Create a new branch with this name. `base` selects the start commit:
+    /// `None` means "fork off the cwd worktree's current HEAD" (the
+    /// expected default); `Some(ref)` lets the caller pin an explicit
+    /// commit / branch / tag / revset.
+    NewBranch {
+        name: &'a str,
+        base: Option<&'a str>,
+    },
     /// Attach to an already-existing branch.
     ExistingBranch(&'a str),
 }
@@ -68,6 +74,13 @@ pub trait Backend {
     /// Current branch (git) / bookmark at @-commit (jj). Default: `None`.
     fn current_branch(&self) -> Option<String> {
         None
+    }
+
+    /// List branches / bookmarks (and tags, where the backend has them) so
+    /// callers can offer a fuzzy picker for `--from`-style base selection.
+    /// Default: empty list.
+    fn list_refs(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
     }
 
     /// Does a branch / bookmark with this name already exist?

@@ -52,9 +52,15 @@ impl Backend for GitBackend {
         let mut cmd = self.git();
         cmd.args(["worktree", "add"]);
         match branch {
-            AddBranch::NewBranch(name) => {
+            AddBranch::NewBranch { name, base } => {
                 cmd.args(["-b", name]);
                 cmd.arg(path);
+                // `git worktree add -b <new> <path> <base>` forks off
+                // <base> instead of HEAD. None → HEAD (the cwd worktree's
+                // tip), which is git's default behavior.
+                if let Some(base) = base {
+                    cmd.arg(base);
+                }
             }
             AddBranch::ExistingBranch(name) => {
                 cmd.arg(path);
@@ -106,6 +112,30 @@ impl Backend for GitBackend {
         }
         let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if s.is_empty() { None } else { Some(s) }
+    }
+
+    fn list_refs(&self) -> Result<Vec<String>> {
+        let output = self
+            .git()
+            .args([
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads",
+                "refs/tags",
+            ])
+            .output()
+            .context("failed to spawn `git`")?;
+        if !output.status.success() {
+            bail!(
+                "git for-each-ref: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect())
     }
 
     fn branch_exists(&self, name: &str) -> bool {
