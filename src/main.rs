@@ -97,11 +97,18 @@ enum Command {
         force: bool,
     },
 
-    /// Print a shell snippet that makes `renri cd` actually `cd` the
-    /// parent shell. Source it from your shell's startup file.
+    /// Print (or install) a shell snippet that makes `renri cd` actually
+    /// `cd` the parent shell instead of spawning a subshell.
     ShellInit {
         #[arg(value_enum)]
         shell: shell_init::Shell,
+
+        /// Append the snippet to your shell's startup file
+        /// (~/.bashrc / ~/.zshrc / ~/.config/fish/config.fish / $PROFILE).
+        /// Idempotent — re-running is a no-op if the snippet is already
+        /// present.
+        #[arg(long)]
+        install: bool,
     },
 
     /// Manage configuration.
@@ -142,8 +149,14 @@ fn main() -> Result<()> {
         Command::Exec { name, argv } => cmd_exec(choice, name, argv, non_interactive),
         Command::Prune => cmd_prune(choice),
         Command::Init { force } => cmd_init(force),
-        Command::ShellInit { shell } => {
-            print!("{}", shell_init::snippet(shell));
+        Command::ShellInit { shell, install } => {
+            if install {
+                let target = shell_init::install(shell)?;
+                println!("renri shell wrapper installed → {}", target.display());
+                println!("restart your shell (or `source` the file) to activate.");
+            } else {
+                print!("{}", shell_init::snippet(shell));
+            }
             Ok(())
         }
     }
@@ -395,8 +408,48 @@ fn cmd_cd(choice: vcs::VcsChoice, name: Option<String>, non_interactive: bool) -
     let opened = open_repo_backend(choice)?;
     let worktrees = opened.backend.list()?;
     let picked = picker::resolve(&worktrees, name.as_deref(), non_interactive, "switch to:")?;
-    println!("{}", picked.path.display());
+
+    // Two modes:
+    //   1. Inside the shell wrapper (`RENRI_SHELL_WRAPPER=1`): print the
+    //      path so the wrapper's parent shell can `cd` to it.
+    //   2. Outside the wrapper: spawn the user's `$SHELL` (or `pwsh` on
+    //      Windows) with cwd = worktree path, so plain `renri cd <name>`
+    //      Just Works without rc-file setup. The user `exit`s to come back.
+    if std::env::var_os("RENRI_SHELL_WRAPPER").is_some() {
+        println!("{}", picked.path.display());
+        return Ok(());
+    }
+
+    spawn_subshell_in(&picked.path)
+}
+
+fn spawn_subshell_in(path: &std::path::Path) -> Result<()> {
+    let shell = pick_subshell();
+    eprintln!(
+        "renri: spawning {shell} in {path}\n\
+         renri: tip — install the shell wrapper for direct cd in your current shell:\n\
+         renri:       eval \"$(renri shell-init bash)\"        # or zsh / fish / powershell\n\
+         renri:       (or `renri shell-init --install bash` to write it to your rc file)",
+        shell = shell,
+        path = path.display(),
+    );
+    let status = std::process::Command::new(&shell)
+        .current_dir(path)
+        .status()
+        .with_context(|| format!("failed to spawn `{shell}`"))?;
+    if !status.success() {
+        // The user's exit code; pass through but don't error-bail.
+        std::process::exit(status.code().unwrap_or(1));
+    }
     Ok(())
+}
+
+fn pick_subshell() -> String {
+    if cfg!(windows) {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "pwsh".into())
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
+    }
 }
 
 fn cmd_remove(choice: vcs::VcsChoice, name: Option<String>, non_interactive: bool) -> Result<()> {
