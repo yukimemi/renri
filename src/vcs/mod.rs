@@ -20,7 +20,11 @@ pub enum VcsChoice {
 }
 
 /// One row in `renri list` — a worktree (git) or workspace (jj).
+///
+/// Marked `#[non_exhaustive]` so adding new fields (a new metric a backend
+/// can populate) isn't a breaking change for external consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Worktree {
     /// Short name — typically the branch / bookmark, falls back to the
     /// directory's basename.
@@ -29,8 +33,16 @@ pub struct Worktree {
     pub path: PathBuf,
     /// Branch (git) or bookmark (jj) name; `None` if detached / anonymous.
     pub branch: Option<String>,
-    /// Commit hash (40-char) of the worktree's HEAD / @-commit.
+    /// Short commit / change id of the worktree's HEAD / @-commit.
     pub head: Option<String>,
+    /// First line of the @-commit / HEAD's description, for `renri list`.
+    pub desc: Option<String>,
+    /// Working copy has uncommitted changes (git: `status --porcelain`
+    /// non-empty, jj: `@` is non-empty vs its parent).
+    pub dirty: bool,
+    /// `@` / HEAD has unresolved conflicts. jj only — git surfaces conflicts
+    /// only during merge.
+    pub conflict: bool,
     /// True for the original / main worktree (the one git/jj was init'd in).
     pub is_main: bool,
     pub is_bare: bool,

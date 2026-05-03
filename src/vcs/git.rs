@@ -45,7 +45,24 @@ impl Backend for GitBackend {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(parse_porcelain(&stdout))
+        let mut wts = parse_porcelain(&stdout);
+        // `parse_porcelain` populates `head` with the full 40-char hash from
+        // `--porcelain` output, but the `head` contract is "short id". Reset
+        // it before asking each worktree's repo for the short form, so a
+        // failed `git_head_summary` (e.g. unborn branch) doesn't leave the
+        // long form in place.
+        for wt in wts.iter_mut() {
+            wt.head = None;
+            if wt.is_stale || wt.is_bare || !wt.path.exists() {
+                continue;
+            }
+            if let Some((id, subject)) = git_head_summary(&wt.path) {
+                wt.head = Some(id);
+                wt.desc = subject;
+            }
+            wt.dirty = git_is_dirty(&wt.path);
+        }
+        Ok(wts)
     }
 
     fn add(&self, path: &Path, branch: AddBranch) -> Result<()> {
@@ -199,6 +216,9 @@ fn parse_porcelain(text: &str) -> Vec<Worktree> {
                     path,
                     branch: None,
                     head: None,
+                    desc: None,
+                    dirty: false,
+                    conflict: false,
                     is_main: false,
                     is_bare: false,
                     is_stale: false,
@@ -246,6 +266,42 @@ fn parse_porcelain(text: &str) -> Vec<Worktree> {
     }
 
     out
+}
+
+/// Run `git log -1 --format=%h<US>%s` inside `path` to fetch the short HEAD
+/// id and one-line subject. Returns `None` if the worktree has no commits or
+/// git fails (e.g. unborn branch).
+fn git_head_summary(path: &Path) -> Option<(String, Option<String>)> {
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(["log", "-1", "--format=%h\x1f%s"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    let trimmed = s.trim_end_matches('\n');
+    let mut parts = trimmed.splitn(2, '\x1f');
+    let id = parts.next()?.to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let subject = parts.next().map(str::to_owned).filter(|s| !s.is_empty());
+    Some((id, subject))
+}
+
+/// `git status --porcelain` non-empty → working copy is dirty. Errors map
+/// to "not dirty" (we'd rather under-report than spuriously flag).
+fn git_is_dirty(path: &Path) -> bool {
+    let Ok(output) = Command::new("git")
+        .current_dir(path)
+        .args(["status", "--porcelain"])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && !output.stdout.is_empty()
 }
 
 fn derive_name(path: &Path) -> String {
