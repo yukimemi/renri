@@ -288,6 +288,17 @@ fn cmd_add(choice: vcs::VcsChoice, name: Option<String>, non_interactive: bool) 
         loaded.config.layout.worktree_path.as_deref(),
     )?;
 
+    // Resolve to an absolute path before any IO. The backends run with
+    // `current_dir = repo_root`, so a relative path (e.g. when the user
+    // configured `worktree_root = "./wt"` in renri.toml) would otherwise
+    // mean two different things at `path.exists()` / `create_dir_all`
+    // (process CWD) versus `backend.add` (repo root).
+    let path = if path.is_absolute() {
+        path
+    } else {
+        opened.repo.root.join(&path)
+    };
+
     if path.exists() {
         anyhow::bail!(
             "target path already exists: {}\n\
