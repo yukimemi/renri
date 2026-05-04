@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/yukimemi/wt/yukimemi/renri/feat-discover-pj/**)",
+      "Bash(jj describe -m ' *)",
+      "Bash(jj bookmark *)",
+      "Bash(jj git *)",
+      "Bash(gh issue *)",
+      "Bash(renri add *)",
+      "Bash(cargo build *)",
+      "Bash(cargo make *)",
+      "Bash(\"C:\\\\Users\\\\yukimemi\\\\wt\\\\yukimemi\\\\renri\\\\feat-gh-repo\\\\target\\\\debug\\\\renri.exe\" gh-repo *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(cd /tmp)",
+      "Bash(\"C:\\\\Users\\\\yukimemi\\\\wt\\\\yukimemi\\\\renri\\\\feat-gh-repo\\\\target\\\\debug\\\\renri.exe\" shell-init *)",
+      "Bash(jj st *)",
+      "Bash(jj diff *)",
+      "Bash(jj restore *)",
+      "Bash(gh run *)",
+      "Bash(jj log *)",
+      "Bash(jj rebase *)",
+      "Bash(jj new *)",
+      "Bash(jj describe *)"
+    ]
+  }
+}
