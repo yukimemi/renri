@@ -145,6 +145,19 @@ enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+
+    /// Print `<owner>/<repo>` for the current repo's `origin` remote, or
+    /// nothing when the cwd is not in a repo or has no parseable origin.
+    ///
+    /// Designed for shell wrappers that want to export `GH_REPO` so the
+    /// `gh` CLI can find the right repo even from a jj workspace (which
+    /// has no `.git/` directory and so isn't auto-detected by `gh`).
+    /// The `renri cd` wrapper from `renri shell-init` calls this after
+    /// changing directory.
+    ///
+    /// Always exits 0; an empty stdout means "no repo / no origin" so
+    /// callers can `unset GH_REPO` cleanly.
+    GhRepo,
 }
 
 #[derive(Subcommand, Debug)]
@@ -201,6 +214,7 @@ fn main() -> Result<()> {
             clap_complete::generate(shell, &mut cmd, bin, &mut std::io::stdout());
             Ok(())
         }
+        Command::GhRepo => cmd_gh_repo(&ctx),
     }
 }
 
@@ -846,6 +860,38 @@ fn cmd_sync(ctx: &CmdCtx) -> Result<()> {
     } else {
         println!("{trimmed}");
     }
+    Ok(())
+}
+
+/// Print `<owner>/<repo>` for the cwd's repo, or nothing on any failure
+/// (no repo, no origin, unparseable origin URL).
+///
+/// Deliberately silent + always exits 0 so the shell wrapper can splat
+/// the result into `GH_REPO` (or `unset` it cleanly when empty) without
+/// noise. We also bypass `open_repo_backend` so a hook context never
+/// triggers an interactive picker — `vcs::detect()` is a pure walk-up
+/// that returns `None` when there's nothing to find.
+fn cmd_gh_repo(ctx: &CmdCtx) -> Result<()> {
+    let Ok(cwd) = ctx.effective_cwd() else {
+        return Ok(());
+    };
+    let Some(repo) = vcs::detect(&cwd) else {
+        return Ok(());
+    };
+    let Ok(kind) = vcs::select_kind(repo.kind, ctx.choice) else {
+        return Ok(());
+    };
+    let Ok(backend) = vcs::open_backend(&repo, kind) else {
+        return Ok(());
+    };
+    let Some(origin) = backend.origin_url() else {
+        return Ok(());
+    };
+    let parsed = layout::parse_origin(&origin);
+    if parsed.owner.is_empty() || parsed.repo.is_empty() {
+        return Ok(());
+    }
+    println!("{}/{}", parsed.owner, parsed.repo);
     Ok(())
 }
 
