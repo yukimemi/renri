@@ -30,7 +30,6 @@ pub fn snippet(shell: Shell) -> &'static str {
 /// the snippet is already present (matched by the marker comment), no-op.
 pub fn install(shell: Shell) -> Result<PathBuf> {
     let target = rc_path(shell)?;
-    let snippet_text = snippet(shell);
 
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
@@ -54,16 +53,49 @@ pub fn install(shell: Shell) -> Result<PathBuf> {
         return Ok(target);
     }
 
+    // Match the host file's existing line endings so a CRLF profile (typical
+    // of Windows / OneDrive-backed PowerShell profiles) does not end up with
+    // an LF-only renri block embedded in it.
+    let use_crlf = detect_crlf(&existing, shell);
+    let eol = if use_crlf { "\r\n" } else { "\n" };
+    let snippet_text = render_snippet(shell, use_crlf);
+
     let mut new_content = existing;
-    if !new_content.is_empty() && !new_content.ends_with('\n') {
-        new_content.push('\n');
+    if !new_content.is_empty() {
+        if !new_content.ends_with('\n') {
+            new_content.push_str(eol);
+        }
+        new_content.push_str(eol);
     }
-    new_content.push('\n');
-    new_content.push_str(snippet_text);
+    new_content.push_str(&snippet_text);
 
     std::fs::write(&target, new_content)
         .with_context(|| format!("writing {}", target.display()))?;
     Ok(target)
+}
+
+/// Match the dominant line ending of `existing`; for an empty file fall back
+/// to CRLF for PowerShell (Windows-only) and LF for every POSIX shell.
+fn detect_crlf(existing: &str, shell: Shell) -> bool {
+    let crlf = existing.matches("\r\n").count();
+    let total_lf = existing.matches('\n').count();
+    let lf_only = total_lf - crlf;
+    if crlf == 0 && lf_only == 0 {
+        matches!(shell, Shell::Powershell)
+    } else {
+        crlf >= lf_only
+    }
+}
+
+fn render_snippet(shell: Shell, use_crlf: bool) -> String {
+    // Normalize the source to LF first so the result is correct even if the
+    // crate's own source file is ever checked out with CRLF endings.
+    let raw = snippet(shell).replace("\r\n", "\n");
+    if use_crlf {
+        raw.replace('\n', "\r\n")
+    } else {
+        raw
+    }
 }
 
 fn rc_path(shell: Shell) -> Result<PathBuf> {
@@ -147,3 +179,54 @@ function renri {
     }
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_crlf_empty_picks_powershell_default() {
+        assert!(detect_crlf("", Shell::Powershell));
+        assert!(!detect_crlf("", Shell::Bash));
+        assert!(!detect_crlf("", Shell::Zsh));
+        assert!(!detect_crlf("", Shell::Fish));
+    }
+
+    #[test]
+    fn detect_crlf_follows_dominant_existing_eol() {
+        assert!(detect_crlf("a\r\nb\r\nc\r\n", Shell::Bash));
+        assert!(!detect_crlf("a\nb\nc\n", Shell::Powershell));
+    }
+
+    #[test]
+    fn detect_crlf_handles_mixed_majority_crlf() {
+        // 3 CRLF + 1 LF-only → still CRLF dominant.
+        assert!(detect_crlf("a\r\nb\r\nc\r\nd\n", Shell::Powershell));
+    }
+
+    #[test]
+    fn render_snippet_normalizes_to_crlf_when_requested() {
+        let crlf = render_snippet(Shell::Powershell, true);
+        assert!(crlf.contains("\r\n"));
+        assert!(!crlf.contains("\n\n"));
+        // Every '\n' must be preceded by '\r'. Use the Unicode-safe scalar
+        // walk so the assertion is panic-safe even if a future snippet ever
+        // ends a line with a multi-byte character.
+        for (i, ch) in crlf.char_indices() {
+            if ch == '\n' {
+                assert_eq!(
+                    crlf[..i].chars().next_back(),
+                    Some('\r'),
+                    "lone LF at byte {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_snippet_keeps_lf_when_not_requested() {
+        let lf = render_snippet(Shell::Bash, false);
+        assert!(!lf.contains('\r'));
+        assert!(lf.contains('\n'));
+    }
+}
