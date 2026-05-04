@@ -136,13 +136,35 @@ fn rc_path(shell: Shell) -> Result<PathBuf> {
 /// installed". Bumping it forces a re-install on the next run.
 const MARKER: &str = "renri shell wrapper";
 
+// After `cd`-ing into the picked worktree, the wrapper also refreshes
+// `GH_REPO` from `renri gh-repo`. This is the stopgap for jj-first
+// workflows — secondary jj workspaces don't have `.git/`, so without
+// `GH_REPO` set, `gh pr create` and friends fail with "not a git
+// repository". `renri gh-repo` is silent on failure so the export
+// path always works (empty value → `unset`).
+//
+// Track jj-vcs/jj#8052: once secondary colocated workspaces ship,
+// `renri add` can default to colocated and this `GH_REPO` dance
+// becomes unnecessary — the snippets here can drop back to a plain
+// cd wrapper.
+
 const POSIX: &str = r#"# renri shell wrapper — paste into ~/.bashrc / ~/.zshrc
-# Usage: `renri cd foo` actually cds the current shell.
+# Usage: `renri cd foo` actually cds the current shell, and exports
+# GH_REPO so the `gh` CLI works from jj workspaces (no .git/).
 renri() {
     if [ "$1" = "cd" ]; then
         local target
         target=$(RENRI_SHELL_WRAPPER=1 command renri cd "${@:2}") || return $?
-        [ -n "$target" ] && cd "$target"
+        if [ -n "$target" ]; then
+            cd "$target" || return $?
+            local repo
+            repo=$(command renri gh-repo 2>/dev/null)
+            if [ -n "$repo" ]; then
+                export GH_REPO="$repo"
+            else
+                unset GH_REPO
+            fi
+        fi
     else
         command renri "$@"
     fi
@@ -153,8 +175,16 @@ const FISH: &str = r#"# renri shell wrapper — paste into ~/.config/fish/config
 function renri
     if test (count $argv) -ge 1; and test "$argv[1]" = "cd"
         set -l target (env RENRI_SHELL_WRAPPER=1 command renri cd $argv[2..-1])
-        and test -n "$target"
-        and cd $target
+        if test $status -eq 0; and test -n "$target"
+            if cd $target
+                set -l repo (command renri gh-repo 2>/dev/null)
+                if test -n "$repo"
+                    set -gx GH_REPO $repo
+                else
+                    set -e GH_REPO
+                end
+            end
+        end
     else
         command renri $argv
     end
@@ -170,6 +200,14 @@ function renri {
             $target = & renri.exe cd @rest
             if ($LASTEXITCODE -eq 0 -and $target) {
                 Set-Location -LiteralPath $target
+                if ($?) {
+                    $repo = & renri.exe gh-repo 2>$null
+                    if ($repo) {
+                        $env:GH_REPO = $repo.Trim()
+                    } else {
+                        Remove-Item Env:GH_REPO -ErrorAction SilentlyContinue
+                    }
+                }
             }
         } finally {
             Remove-Item Env:RENRI_SHELL_WRAPPER -ErrorAction SilentlyContinue
