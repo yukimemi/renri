@@ -9,7 +9,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use teravars::{Engine, system_context};
 
 use renri::{
-    config, discovery, hooks, layout, path_display::display_path, picker, shell_init, vcs,
+    config, discovery, hooks, layout, path_display::display_path, picker, shell_init, updater, vcs,
 };
 
 #[derive(Parser, Debug)]
@@ -158,6 +158,17 @@ enum Command {
     /// Always exits 0; an empty stdout means "no repo / no origin" so
     /// callers can `unset GH_REPO` cleanly.
     GhRepo,
+
+    /// Update the renri binary itself to the latest GitHub release.
+    SelfUpdate {
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Print availability and exit without installing
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -177,6 +188,12 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Spawn background update check if not running self-update or completions.
+    let update_check_handle = match cli.command {
+        Command::SelfUpdate { .. } | Command::Completions { .. } => None,
+        _ => maybe_spawn_auto_update_check(),
+    };
+
     let choice = vcs_choice(cli.vcs);
     let non_interactive = cli.non_interactive;
     let cwd_override = cli.cwd;
@@ -186,7 +203,7 @@ fn main() -> Result<()> {
         cwd_override: cwd_override.as_deref().map(std::path::Path::to_path_buf),
     };
 
-    match cli.command {
+    let result = match cli.command {
         Command::List { refresh } => cmd_list(&ctx, refresh),
         Command::Config {
             sub: ConfigCommand::Show,
@@ -215,6 +232,117 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::GhRepo => cmd_gh_repo(&ctx),
+        Command::SelfUpdate { yes, check } => {
+            updater::run_self_update(yes, check, ctx.non_interactive)
+        }
+    };
+
+    if let Some(handle) = update_check_handle {
+        finalize_auto_update_check(handle);
+    }
+
+    result
+}
+
+/// Handle for an ongoing or cached background update check.
+enum AutoUpdateHandle {
+    /// A newer version was found in the local cache from a previous run.
+    CachedAvailable {
+        current: String,
+        latest: updater::LatestRelease,
+    },
+    /// A background check is currently in progress.
+    Pending {
+        current: String,
+        rx: std::sync::mpsc::Receiver<Result<updater::LatestRelease>>,
+    },
+}
+
+/// Spawns a background thread to check for updates if the interval has elapsed.
+fn maybe_spawn_auto_update_check() -> Option<AutoUpdateHandle> {
+    // Load config to check if auto_update_check is enabled.
+    // Try to detect repo root for project-local config.
+    let cwd = std::env::current_dir().ok()?;
+    let repo_root = vcs::detect(&cwd).map(|r| r.root);
+    let loaded = config::Config::load(repo_root.as_deref()).unwrap_or_default();
+    if !loaded.config.ui.auto_update_check {
+        return None;
+    }
+
+    let state = updater::load_check_state();
+    let now = std::time::SystemTime::now();
+    let current = env!("CARGO_PKG_VERSION").to_string();
+
+    let interval = match loaded.config.ui.update_check_interval.as_deref() {
+        Some(s) => match humantime::parse_duration(s) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(value = %s, error = %e, "invalid ui.update_check_interval; using default");
+                updater::default_interval()
+            }
+        },
+        None => updater::default_interval(),
+    };
+
+    if !updater::should_auto_check(state.as_ref(), interval, now) {
+        if let Some(state) = state {
+            if let Some(cached_tag) = state.last_known_latest.as_ref() {
+                if updater::is_update_available(&current, cached_tag).unwrap_or(false) {
+                    return Some(AutoUpdateHandle::CachedAvailable {
+                        current,
+                        latest: updater::LatestRelease {
+                            tag_name: cached_tag.clone(),
+                            html_url: state.last_known_url.unwrap_or_default(),
+                        },
+                    });
+                }
+            }
+        }
+        return None;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(updater::check_latest_release());
+    });
+
+    Some(AutoUpdateHandle::Pending { current, rx })
+}
+
+/// Waits for the background update check to complete (with a short timeout) and prints a banner if an update is available.
+fn finalize_auto_update_check(handle: AutoUpdateHandle) {
+    match handle {
+        AutoUpdateHandle::CachedAvailable { current, latest } => {
+            eprintln!("\n{}", updater::format_update_banner(&current, &latest));
+        }
+        AutoUpdateHandle::Pending { current, rx } => {
+            // Wait for 1 second.
+            let res = rx.recv_timeout(std::time::Duration::from_secs(1));
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let mut state = updater::load_check_state().unwrap_or(updater::UpdateCheckState {
+                last_checked_unix: 0,
+                last_known_latest: None,
+                last_known_url: None,
+            });
+
+            state.last_checked_unix = now_unix;
+
+            if let Ok(Ok(latest)) = res {
+                state.last_known_latest = Some(latest.tag_name.clone());
+                state.last_known_url = Some(latest.html_url.clone());
+                let _ = updater::save_check_state(&state);
+                if updater::is_update_available(&current, &latest.tag_name).unwrap_or(false) {
+                    eprintln!("\n{}", updater::format_update_banner(&current, &latest));
+                }
+            } else {
+                // Even on timeout or error, update the last_checked_unix to avoid constant checking.
+                let _ = updater::save_check_state(&state);
+            }
+        }
     }
 }
 

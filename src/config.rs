@@ -40,6 +40,14 @@ pub struct UiConfig {
     /// the next `renri list`. Defaults to 24.
     #[serde(default = "default_pr_cache_ttl_hours")]
     pub pr_cache_ttl_hours: u64,
+
+    /// When true, renri checks for updates in the background on each run.
+    #[serde(default = "default_auto_update_check")]
+    pub auto_update_check: bool,
+
+    /// Interval between background update checks (e.g., "24h", "1d").
+    #[serde(default)]
+    pub update_check_interval: Option<String>,
 }
 
 impl Default for UiConfig {
@@ -47,12 +55,18 @@ impl Default for UiConfig {
         Self {
             show_pr: false,
             pr_cache_ttl_hours: default_pr_cache_ttl_hours(),
+            auto_update_check: default_auto_update_check(),
+            update_check_interval: None,
         }
     }
 }
 
 fn default_pr_cache_ttl_hours() -> u64 {
     24
+}
+
+fn default_auto_update_check() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
