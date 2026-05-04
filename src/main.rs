@@ -2,11 +2,15 @@
 //!
 //! See ROADMAP.md for the design and the staged work plan.
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use teravars::{Engine, system_context};
 
-use renri::{config, hooks, layout, path_display::display_path, picker, shell_init, vcs};
+use renri::{
+    config, discovery, hooks, layout, path_display::display_path, picker, shell_init, vcs,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "renri", version, about, long_about = None)]
@@ -19,6 +23,14 @@ struct Cli {
     /// command instead of opening a picker.
     #[arg(long, global = true)]
     non_interactive: bool,
+
+    /// Run as if renri was started in `<PATH>` instead of the actual current
+    /// directory. Mirrors `git -C`. Repeated uses are not supported (last
+    /// wins). When the resolved path is *outside* any repo, renri walks the
+    /// configured worktree root for managed projects and offers an
+    /// interactive picker (skip with `--non-interactive`).
+    #[arg(short = 'C', long = "cwd", global = true, value_name = "PATH")]
+    cwd: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -154,18 +166,24 @@ fn main() -> Result<()> {
 
     let choice = vcs_choice(cli.vcs);
     let non_interactive = cli.non_interactive;
+    let cwd_override = cli.cwd;
+    let ctx = CmdCtx {
+        choice,
+        non_interactive,
+        cwd_override: cwd_override.as_deref().map(std::path::Path::to_path_buf),
+    };
 
     match cli.command {
-        Command::List { refresh } => cmd_list(choice, refresh),
+        Command::List { refresh } => cmd_list(&ctx, refresh),
         Command::Config {
             sub: ConfigCommand::Show,
-        } => cmd_config_show(choice),
-        Command::Add { name, from } => cmd_add(choice, name, from, non_interactive),
-        Command::Remove { name } => cmd_remove(choice, name, non_interactive),
-        Command::Cd { name } => cmd_cd(choice, name, non_interactive),
-        Command::Exec { name, argv } => cmd_exec(choice, name, argv, non_interactive),
-        Command::Prune => cmd_prune(choice),
-        Command::Init { force } => cmd_init(force),
+        } => cmd_config_show(&ctx),
+        Command::Add { name, from } => cmd_add(&ctx, name, from),
+        Command::Remove { name } => cmd_remove(&ctx, name),
+        Command::Cd { name } => cmd_cd(&ctx, name),
+        Command::Exec { name, argv } => cmd_exec(&ctx, name, argv),
+        Command::Prune => cmd_prune(&ctx),
+        Command::Init { force } => cmd_init(cwd_override.as_deref(), force),
         Command::ShellInit { shell, install } => {
             if install {
                 let target = shell_init::install(shell)?;
@@ -176,7 +194,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Sync => cmd_sync(choice),
+        Command::Sync => cmd_sync(&ctx),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             let bin = cmd.get_name().to_string();
@@ -186,11 +204,34 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_list(choice: vcs::VcsChoice, refresh: bool) -> Result<()> {
+/// Bundle of process-level flags every command needs. Lets us add new
+/// global flags (`--cwd`, future things) without rippling through every
+/// `cmd_*` signature.
+struct CmdCtx {
+    choice: vcs::VcsChoice,
+    non_interactive: bool,
+    cwd_override: Option<PathBuf>,
+}
+
+impl CmdCtx {
+    fn effective_cwd(&self) -> Result<PathBuf> {
+        match self.cwd_override.as_deref() {
+            Some(p) => {
+                if !p.exists() {
+                    anyhow::bail!("--cwd path does not exist: {}", p.display());
+                }
+                Ok(p.to_path_buf())
+            }
+            None => std::env::current_dir().context("could not read current directory"),
+        }
+    }
+}
+
+fn cmd_list(ctx: &CmdCtx, refresh: bool) -> Result<()> {
     use owo_colors::OwoColorize;
     use renri::pr_cache;
 
-    let opened = open_repo_backend(choice)?;
+    let opened = open_repo_backend(ctx)?;
     let worktrees = opened.backend.list()?;
     if worktrees.is_empty() {
         return Ok(());
@@ -365,18 +406,88 @@ struct OpenedRepo {
     backend: Box<dyn vcs::Backend>,
 }
 
-fn open_repo_backend(choice: vcs::VcsChoice) -> Result<OpenedRepo> {
-    let cwd = std::env::current_dir().context("could not read current directory")?;
-    let repo = vcs::detect(&cwd).context("not inside a git or jj repository")?;
-    let kind = vcs::select_kind(repo.kind, choice)?;
+fn open_repo_backend(ctx: &CmdCtx) -> Result<OpenedRepo> {
+    let cwd = ctx.effective_cwd()?;
+
+    // Fast path: cwd (or `--cwd <path>`) is inside a git/jj repo.
+    if let Some(repo) = vcs::detect(&cwd) {
+        let kind = vcs::select_kind(repo.kind, ctx.choice)?;
+        let backend = vcs::open_backend(&repo, kind)?;
+        return Ok(OpenedRepo { repo, backend });
+    }
+
+    // Slow path: cwd is *outside* any repo. Walk the configured worktree
+    // root for projects renri already manages and let the user pick one.
+    let picked_path = pick_managed_project(ctx)?;
+    let repo = vcs::detect(&picked_path).with_context(|| {
+        format!(
+            "discovered project {} is no longer a git/jj repo (was it removed?)",
+            picked_path.display()
+        )
+    })?;
+    let kind = vcs::select_kind(repo.kind, ctx.choice)?;
     let backend = vcs::open_backend(&repo, kind)?;
     Ok(OpenedRepo { repo, backend })
 }
 
-fn cmd_config_show(choice: vcs::VcsChoice) -> Result<()> {
+/// Resolve a worktree root from the user's *global* config (or the built-in
+/// default), then walk it for managed projects and prompt for one.
+///
+/// Project-local `renri.toml` is intentionally not consulted here — we're
+/// outside the repo, so there's no project to read it from. The global
+/// config + built-in default are enough to know where worktrees live.
+fn pick_managed_project(ctx: &CmdCtx) -> Result<PathBuf> {
+    let mut engine = Engine::new();
+    // No repo root → only global config + defaults are considered.
+    let loaded = config::Config::load_with_engine(None, &mut engine).unwrap_or_default();
+    let root = layout::render_worktree_root(
+        &mut engine,
+        &system_context(),
+        loaded.config.layout.worktree_root.as_deref(),
+    )?;
+
+    let projects = discovery::scan(&root);
+    if projects.is_empty() {
+        anyhow::bail!(
+            "not inside a git or jj repository, and no managed projects found under {}.\n\
+             tip: cd into a repo, pass `-C <path>`, or `renri add <branch>` from a repo first.",
+            display_path(&root)
+        );
+    }
+
+    if ctx.non_interactive {
+        anyhow::bail!(
+            "not inside a git or jj repository and --non-interactive set; \
+             pass `-C <path>` or cd into a repo"
+        );
+    }
+
+    let picked = pick_project_interactive(&projects)?;
+    Ok(picked.entry_path().to_path_buf())
+}
+
+fn pick_project_interactive(projects: &[discovery::Project]) -> Result<&discovery::Project> {
+    let items: Vec<ProjectItem<'_>> = projects.iter().map(ProjectItem).collect();
+    let picked = inquire::Select::new("project:", items)
+        .prompt()
+        .context("interactive pick cancelled")?;
+    Ok(picked.0)
+}
+
+struct ProjectItem<'a>(&'a discovery::Project);
+
+impl std::fmt::Display for ProjectItem<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.0.worktrees.len();
+        let suffix = if n == 1 { "worktree" } else { "worktrees" };
+        write!(f, "{}  ({n} {suffix})", self.0.label)
+    }
+}
+
+fn cmd_config_show(ctx: &CmdCtx) -> Result<()> {
     use owo_colors::OwoColorize;
 
-    let opened = open_repo_backend(choice)?;
+    let opened = open_repo_backend(ctx)?;
     let mut engine = Engine::new();
 
     let loaded = config::Config::load_with_engine(Some(&opened.repo.root), &mut engine)?;
@@ -465,12 +576,7 @@ fn cmd_config_show(choice: vcs::VcsChoice) -> Result<()> {
     Ok(())
 }
 
-fn cmd_add(
-    choice: vcs::VcsChoice,
-    name: Option<String>,
-    from: Option<String>,
-    non_interactive: bool,
-) -> Result<()> {
+fn cmd_add(ctx: &CmdCtx, name: Option<String>, from: Option<String>) -> Result<()> {
     // Trim the user-supplied `--from`. An empty string after trim is the
     // signal for "open the picker" (clap's `default_missing_value = ""`),
     // so preserve `Some("")` here instead of filtering it out.
@@ -478,13 +584,13 @@ fn cmd_add(
 
     let name = match name {
         Some(n) => n.trim().to_string(),
-        None => prompt_branch_name(non_interactive)?,
+        None => prompt_branch_name(ctx.non_interactive)?,
     };
     if name.is_empty() {
         anyhow::bail!("branch / bookmark name must not be empty");
     }
 
-    let opened = open_repo_backend(choice)?;
+    let opened = open_repo_backend(ctx)?;
     let mut engine = Engine::new();
 
     let loaded = config::Config::load_with_engine(Some(&opened.repo.root), &mut engine)?;
@@ -537,7 +643,10 @@ fn cmd_add(
     //   Some(ref)  → use ref as-is
     let from_resolved = match from.as_deref() {
         None => None,
-        Some("") => Some(prompt_base_ref(opened.backend.as_ref(), non_interactive)?),
+        Some("") => Some(prompt_base_ref(
+            opened.backend.as_ref(),
+            ctx.non_interactive,
+        )?),
         Some(ref_str) => Some(ref_str.to_string()),
     };
 
@@ -580,10 +689,15 @@ fn cmd_add(
     Ok(())
 }
 
-fn cmd_cd(choice: vcs::VcsChoice, name: Option<String>, non_interactive: bool) -> Result<()> {
-    let opened = open_repo_backend(choice)?;
+fn cmd_cd(ctx: &CmdCtx, name: Option<String>) -> Result<()> {
+    let opened = open_repo_backend(ctx)?;
     let worktrees = opened.backend.list()?;
-    let picked = picker::resolve(&worktrees, name.as_deref(), non_interactive, "switch to:")?;
+    let picked = picker::resolve(
+        &worktrees,
+        name.as_deref(),
+        ctx.non_interactive,
+        "switch to:",
+    )?;
 
     // Two modes:
     //   1. Inside the shell wrapper (`RENRI_SHELL_WRAPPER=1`): print the
@@ -628,13 +742,14 @@ fn pick_subshell() -> String {
     }
 }
 
-fn cmd_remove(choice: vcs::VcsChoice, name: Option<String>, non_interactive: bool) -> Result<()> {
-    let opened = open_repo_backend(choice)?;
+fn cmd_remove(ctx: &CmdCtx, name: Option<String>) -> Result<()> {
+    let opened = open_repo_backend(ctx)?;
     let mut engine = Engine::new();
     let loaded = config::Config::load_with_engine(Some(&opened.repo.root), &mut engine)?;
 
     let worktrees = opened.backend.list()?;
-    let picked = picker::resolve(&worktrees, name.as_deref(), non_interactive, "remove:")?.clone();
+    let picked =
+        picker::resolve(&worktrees, name.as_deref(), ctx.non_interactive, "remove:")?.clone();
 
     if picked.is_main {
         anyhow::bail!(
@@ -665,19 +780,14 @@ fn cmd_remove(choice: vcs::VcsChoice, name: Option<String>, non_interactive: boo
     Ok(())
 }
 
-fn cmd_exec(
-    choice: vcs::VcsChoice,
-    name: Option<String>,
-    argv: Vec<String>,
-    non_interactive: bool,
-) -> Result<()> {
+fn cmd_exec(ctx: &CmdCtx, name: Option<String>, argv: Vec<String>) -> Result<()> {
     if argv.is_empty() {
         anyhow::bail!("no command was given (use `renri exec <name> -- cmd args...`)");
     }
 
-    let opened = open_repo_backend(choice)?;
+    let opened = open_repo_backend(ctx)?;
     let worktrees = opened.backend.list()?;
-    let picked = picker::resolve(&worktrees, name.as_deref(), non_interactive, "exec in:")?;
+    let picked = picker::resolve(&worktrees, name.as_deref(), ctx.non_interactive, "exec in:")?;
 
     let status = std::process::Command::new(&argv[0])
         .args(&argv[1..])
@@ -691,8 +801,11 @@ fn cmd_exec(
     Ok(())
 }
 
-fn cmd_init(force: bool) -> Result<()> {
-    let cwd = std::env::current_dir().context("could not read current directory")?;
+fn cmd_init(cwd_override: Option<&std::path::Path>, force: bool) -> Result<()> {
+    let cwd = match cwd_override {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().context("could not read current directory")?,
+    };
     let target = cwd.join("renri.toml");
 
     if target.exists() && !force {
@@ -712,8 +825,8 @@ const INIT_TEMPLATE: &str = r#"# renri.toml
 # Schema and examples: https://github.com/yukimemi/renri
 "#;
 
-fn cmd_prune(choice: vcs::VcsChoice) -> Result<()> {
-    let opened = open_repo_backend(choice)?;
+fn cmd_prune(ctx: &CmdCtx) -> Result<()> {
+    let opened = open_repo_backend(ctx)?;
     let output = opened.backend.prune()?;
     let trimmed = output.trim();
     if trimmed.is_empty() {
@@ -724,8 +837,8 @@ fn cmd_prune(choice: vcs::VcsChoice) -> Result<()> {
     Ok(())
 }
 
-fn cmd_sync(choice: vcs::VcsChoice) -> Result<()> {
-    let opened = open_repo_backend(choice)?;
+fn cmd_sync(ctx: &CmdCtx) -> Result<()> {
+    let opened = open_repo_backend(ctx)?;
     let output = opened.backend.fetch()?;
     let trimmed = output.trim();
     if trimmed.is_empty() {

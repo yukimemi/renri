@@ -98,6 +98,23 @@ fn split_owner_repo(path: &str) -> (&str, &str) {
     }
 }
 
+/// Render only the worktree-root template (without a per-branch sub-path).
+///
+/// Used by the discovery flow when renri is invoked from outside any repo:
+/// we don't have `vcs.*` yet so we can't render `worktree_path`, but the
+/// root is vcs-independent in every realistic config.
+pub fn render_worktree_root(
+    engine: &mut Engine,
+    base_ctx: &TeraCtx,
+    root_template: Option<&str>,
+) -> Result<PathBuf> {
+    let root_t = root_template.unwrap_or(DEFAULT_WORKTREE_ROOT);
+    let root = engine
+        .render(root_t, base_ctx)
+        .context("rendering layout.worktree_root")?;
+    Ok(PathBuf::from(root.trim()))
+}
+
 /// Render the worktree path templates with the given context, returning the
 /// joined absolute path.
 pub fn render_path(
@@ -107,20 +124,17 @@ pub fn render_path(
     root_template: Option<&str>,
     path_template: Option<&str>,
 ) -> Result<PathBuf> {
-    let root_t = root_template.unwrap_or(DEFAULT_WORKTREE_ROOT);
     let path_t = path_template.unwrap_or(DEFAULT_WORKTREE_PATH);
 
     let mut ctx = base_ctx.clone();
     ctx.insert("vcs", vcs);
 
-    let root = engine
-        .render(root_t, &ctx)
-        .context("rendering layout.worktree_root")?;
+    let root = render_worktree_root(engine, &ctx, root_template)?;
     let sub = engine
         .render(path_t, &ctx)
         .context("rendering layout.worktree_path")?;
 
-    Ok(PathBuf::from(root.trim()).join(sub.trim()))
+    Ok(root.join(sub.trim()))
 }
 
 #[cfg(test)]

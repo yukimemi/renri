@@ -1,6 +1,7 @@
 //! renri — unified manager for git worktrees and jj workspaces.
 
 pub mod config;
+pub mod discovery;
 pub mod hooks;
 pub mod layout;
 pub mod path_display;
