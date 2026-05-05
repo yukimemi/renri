@@ -70,19 +70,36 @@ fn resolve_by_query<'a>(worktrees: &'a [Worktree], query: &str) -> Result<&'a Wo
 }
 
 fn pick_interactive<'a>(worktrees: &'a [Worktree], prompt: &str) -> Result<&'a Worktree> {
-    let items: Vec<Item<'_>> = worktrees.iter().map(Item).collect();
+    // Mixed-backend lists (colocated repos) get a `[jj]` / `[git]` prefix
+    // on every row so the user can tell collisions apart at a glance.
+    // Single-backend lists keep the unprefixed display they always had.
+    let show_vcs = worktrees.iter().any(|w| w.vcs != worktrees[0].vcs);
+    let items: Vec<Item<'_>> = worktrees.iter().map(|w| Item { wt: w, show_vcs }).collect();
     let picked = inquire::Select::new(prompt, items)
         .prompt()
         .context("interactive pick cancelled")?;
-    Ok(picked.0)
+    Ok(picked.wt)
 }
 
-struct Item<'a>(&'a Worktree);
+struct Item<'a> {
+    wt: &'a Worktree,
+    show_vcs: bool,
+}
 
 impl fmt::Display for Item<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let main = if self.0.is_main { " (main)" } else { "" };
-        write!(f, "{}{}  {}", self.0.name, main, self.0.path.display())
+        let main = if self.wt.is_main { " (main)" } else { "" };
+        let prefix = if self.show_vcs {
+            format!("[{}] ", crate::vcs::kind_short(self.wt.vcs))
+        } else {
+            String::new()
+        };
+        write!(
+            f,
+            "{prefix}{}{main}  {}",
+            self.wt.name,
+            self.wt.path.display()
+        )
     }
 }
 
@@ -104,6 +121,7 @@ mod tests {
             is_bare: false,
             is_stale: false,
             is_locked: false,
+            vcs: crate::vcs::Kind::Git,
         }
     }
 

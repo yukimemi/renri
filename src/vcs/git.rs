@@ -5,7 +5,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use super::{AddBranch, Backend, Worktree};
+use super::{AddBranch, Backend, Kind, Worktree};
 
 pub struct GitBackend {
     root: PathBuf,
@@ -239,6 +239,7 @@ fn parse_porcelain(text: &str) -> Vec<Worktree> {
                     is_bare: false,
                     is_stale: false,
                     is_locked: false,
+                    vcs: Kind::Git,
                 });
             }
             "HEAD" => {

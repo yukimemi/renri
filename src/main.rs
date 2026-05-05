@@ -374,7 +374,7 @@ fn cmd_list(ctx: &CmdCtx, refresh: bool) -> Result<()> {
     use renri::pr_cache;
 
     let opened = open_repo_backend(ctx)?;
-    let worktrees = opened.backend.list()?;
+    let worktrees = opened.list_all()?;
     if worktrees.is_empty() {
         return Ok(());
     }
@@ -384,13 +384,18 @@ fn cmd_list(ctx: &CmdCtx, refresh: bool) -> Result<()> {
     // an empty map rather than aborting the whole list.
     let loaded = config::Config::load(Some(&opened.repo.root)).unwrap_or_default();
     let show_pr = loaded.config.ui.show_pr;
+    // Show the VCS column whenever more than one backend is in play. In
+    // colocated repos this lets the user tell at a glance which side a row
+    // came from (the main concrete UX bug this column was added for).
+    let show_vcs = opened.is_multi();
     let prs = if show_pr {
+        // Origin / branch are the same across both backends in a colocated
+        // repo (they share the git store), so primary() is fine here.
         let branch = opened
-            .backend
+            .primary()
             .current_branch()
             .unwrap_or_else(|| "main".into());
-        let vcs_ctx =
-            layout::discover_vcs_context(opened.backend.as_ref(), &opened.repo.root, &branch);
+        let vcs_ctx = layout::discover_vcs_context(opened.primary(), &opened.repo.root, &branch);
         pr_cache::load_or_refresh(
             &vcs_ctx.owner,
             &vcs_ctx.repo,
@@ -438,21 +443,19 @@ fn cmd_list(ctx: &CmdCtx, refresh: bool) -> Result<()> {
 
     // Header on stdout so the whole table is on one stream — piping or
     // redirecting `renri list` keeps the column legend.
-    if show_pr {
-        println!(
-            "  {name:name_w$}  {st}  {pr:pr_w$}  {desc}",
-            name = "NAME".dimmed(),
-            st = "ST".dimmed(),
-            pr = "PR".dimmed(),
-            desc = "DESCRIPTION".dimmed(),
-        );
+    let header_name = format!("{:name_w$}", "NAME").dimmed().to_string();
+    let header_st = "ST".dimmed().to_string();
+    let header_desc = "DESCRIPTION".dimmed().to_string();
+    let header_vcs = if show_vcs {
+        format!("  {}", "VCS".dimmed())
     } else {
-        println!(
-            "  {name:name_w$}  {st}  {desc}",
-            name = "NAME".dimmed(),
-            st = "ST".dimmed(),
-            desc = "DESCRIPTION".dimmed(),
-        );
+        String::new()
+    };
+    if show_pr {
+        let header_pr = format!("{:pr_w$}", "PR").dimmed().to_string();
+        println!("  {header_name}{header_vcs}  {header_st}  {header_pr}  {header_desc}");
+    } else {
+        println!("  {header_name}{header_vcs}  {header_st}  {header_desc}");
     }
 
     for row in &rows {
@@ -498,6 +501,17 @@ fn cmd_list(ctx: &CmdCtx, refresh: bool) -> Result<()> {
 
         let name_pad = " ".repeat(name_w.saturating_sub(row.name.chars().count()));
 
+        // VCS cell: dim, fixed width 3 (`jj ` / `git`). Pad BEFORE
+        // dimming — `dimmed()` wraps in ANSI escape codes which the
+        // `{:N}` width specifier counts as visible characters, breaking
+        // alignment of every column to its right.
+        let vcs_cell = if show_vcs {
+            let short = format!("{:3}", vcs::kind_short(row.vcs));
+            format!("  {}", short.dimmed())
+        } else {
+            String::new()
+        };
+
         if show_pr {
             // PR cell: number colored by state, dim placeholder when absent.
             let pr_cell = match (row.pr.as_deref(), row.pr_state.as_deref()) {
@@ -509,9 +523,9 @@ fn cmd_list(ctx: &CmdCtx, refresh: bool) -> Result<()> {
             };
             let pr_raw_len = row.pr.as_deref().map_or(1, |s| s.chars().count());
             let pr_pad = " ".repeat(pr_w.saturating_sub(pr_raw_len));
-            println!("{marker} {name}{name_pad}  {status}   {pr_cell}{pr_pad}  {desc}");
+            println!("{marker} {name}{name_pad}{vcs_cell}  {status}   {pr_cell}{pr_pad}  {desc}");
         } else {
-            println!("{marker} {name}{name_pad}  {status}   {desc}");
+            println!("{marker} {name}{name_pad}{vcs_cell}  {status}   {desc}");
         }
     }
     Ok(())
@@ -526,6 +540,7 @@ struct ListRow {
     conflict: bool,
     pr: Option<String>,
     pr_state: Option<String>,
+    vcs: vcs::Kind,
 }
 
 impl From<&vcs::Worktree> for ListRow {
@@ -539,37 +554,86 @@ impl From<&vcs::Worktree> for ListRow {
             conflict: w.conflict,
             pr: None,
             pr_state: None,
+            vcs: w.vcs,
         }
     }
 }
 
+/// One repo opened against potentially multiple backends. Colocated repos
+/// under `--vcs auto` carry **two** backends (jj first, git second) so
+/// union-aware verbs (`list` / `prune` / `sync`) can show both stores
+/// without losing the long-standing jj-priority policy: `primary()`
+/// returns `backends[0]` and that's what single-store verbs (`add`,
+/// `config show`, `gh-repo`) use.
 struct OpenedRepo {
     repo: vcs::Repo,
-    backend: Box<dyn vcs::Backend>,
+    backends: Vec<(vcs::Kind, Box<dyn vcs::Backend>)>,
+}
+
+impl OpenedRepo {
+    /// First-choice backend. Always present (the constructor refuses to
+    /// build an empty `backends`). For colocated + Auto this is jj,
+    /// matching the policy documented in CLAUDE.md.
+    fn primary(&self) -> &dyn vcs::Backend {
+        self.backends[0].1.as_ref()
+    }
+
+    /// True when more than one backend is in play (colocated + Auto).
+    /// Drives whether `list` shows a VCS column and whether the picker
+    /// prefixes rows with their backend.
+    fn is_multi(&self) -> bool {
+        self.backends.len() > 1
+    }
+
+    /// Union of every backend's `list()`. Rows are already tagged via
+    /// `Worktree::vcs` so the caller can dispatch per-row.
+    ///
+    /// Bails on the first backend failure rather than silently masking
+    /// half the view — a missing `jj` binary in a colocated repo is a
+    /// configuration problem worth surfacing, not papering over.
+    fn list_all(&self) -> Result<Vec<vcs::Worktree>> {
+        let mut all = Vec::new();
+        for (_, b) in &self.backends {
+            all.extend(b.list()?);
+        }
+        Ok(all)
+    }
+
+    /// Backend that produced a particular row. Used by `remove` (and
+    /// anything else that has to dispatch to the right store given a
+    /// specific worktree).
+    fn backend_for(&self, kind: vcs::Kind) -> Option<&dyn vcs::Backend> {
+        self.backends
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, b)| b.as_ref())
+    }
 }
 
 fn open_repo_backend(ctx: &CmdCtx) -> Result<OpenedRepo> {
     let cwd = ctx.effective_cwd()?;
 
     // Fast path: cwd (or `--cwd <path>`) is inside a git/jj repo.
-    if let Some(repo) = vcs::detect(&cwd) {
-        let kind = vcs::select_kind(repo.kind, ctx.choice)?;
-        let backend = vcs::open_backend(&repo, kind)?;
-        return Ok(OpenedRepo { repo, backend });
-    }
+    let repo = if let Some(repo) = vcs::detect(&cwd) {
+        repo
+    } else {
+        // Slow path: cwd is *outside* any repo. Walk the configured worktree
+        // root for projects renri already manages and let the user pick one.
+        let picked_path = pick_managed_project(ctx)?;
+        vcs::detect(&picked_path).with_context(|| {
+            format!(
+                "discovered project {} is no longer a git/jj repo (was it removed?)",
+                picked_path.display()
+            )
+        })?
+    };
 
-    // Slow path: cwd is *outside* any repo. Walk the configured worktree
-    // root for projects renri already manages and let the user pick one.
-    let picked_path = pick_managed_project(ctx)?;
-    let repo = vcs::detect(&picked_path).with_context(|| {
-        format!(
-            "discovered project {} is no longer a git/jj repo (was it removed?)",
-            picked_path.display()
-        )
-    })?;
-    let kind = vcs::select_kind(repo.kind, ctx.choice)?;
-    let backend = vcs::open_backend(&repo, kind)?;
-    Ok(OpenedRepo { repo, backend })
+    let kinds = vcs::select_kinds(repo.kind, ctx.choice)?;
+    let backends = kinds
+        .into_iter()
+        .map(|k| vcs::open_backend(&repo, k).map(|b| (k, b)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(OpenedRepo { repo, backends })
 }
 
 /// Resolve a worktree root from the user's *global* config (or the built-in
@@ -634,13 +698,13 @@ fn cmd_config_show(ctx: &CmdCtx) -> Result<()> {
 
     let loaded = config::Config::load_with_engine(Some(&opened.repo.root), &mut engine)?;
 
-    let branch_opt = opened.backend.current_branch();
+    let branch_opt = opened.primary().current_branch();
     // The placeholder we hand the layout renderer when there's no current
     // branch. Renders as `…/(none)` in the resolved path, which we suppress
     // below since the path isn't meaningful without a real branch.
     let branch_display = branch_opt.clone().unwrap_or_else(|| "(none)".into());
     let vcs_ctx =
-        layout::discover_vcs_context(opened.backend.as_ref(), &opened.repo.root, &branch_display);
+        layout::discover_vcs_context(opened.primary(), &opened.repo.root, &branch_display);
 
     let resolved_path = layout::render_path(
         &mut engine,
@@ -664,7 +728,22 @@ fn cmd_config_show(ctx: &CmdCtx) -> Result<()> {
         .unwrap_or(layout::DEFAULT_WORKTREE_PATH);
 
     println!("{}", "repo".dimmed());
-    println!("  backend:           {}", opened.backend.name());
+    let backends_label = opened
+        .backends
+        .iter()
+        .map(|(_, b)| b.name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if opened.is_multi() {
+        // Surface both stores so the user can see at a glance that the
+        // colocated repo will be unioned by `list` / `prune` etc.
+        println!(
+            "  backends:          {backends_label} (primary: {})",
+            opened.primary().name()
+        );
+    } else {
+        println!("  backend:           {backends_label}");
+    }
     println!("  root:              {}", display_path(&opened.repo.root));
 
     println!();
@@ -737,7 +816,7 @@ fn cmd_add(ctx: &CmdCtx, name: Option<String>, from: Option<String>) -> Result<(
 
     let loaded = config::Config::load_with_engine(Some(&opened.repo.root), &mut engine)?;
 
-    let vcs_ctx = layout::discover_vcs_context(opened.backend.as_ref(), &opened.repo.root, &name);
+    let vcs_ctx = layout::discover_vcs_context(opened.primary(), &opened.repo.root, &name);
     let base_ctx = system_context();
 
     let path = layout::render_path(
@@ -785,14 +864,11 @@ fn cmd_add(ctx: &CmdCtx, name: Option<String>, from: Option<String>) -> Result<(
     //   Some(ref)  → use ref as-is
     let from_resolved = match from.as_deref() {
         None => None,
-        Some("") => Some(prompt_base_ref(
-            opened.backend.as_ref(),
-            ctx.non_interactive,
-        )?),
+        Some("") => Some(prompt_base_ref(opened.primary(), ctx.non_interactive)?),
         Some(ref_str) => Some(ref_str.to_string()),
     };
 
-    let strategy = if opened.backend.branch_exists(&name) {
+    let strategy = if opened.primary().branch_exists(&name) {
         if from_resolved.is_some() {
             tracing::warn!(
                 branch = %name,
@@ -812,7 +888,7 @@ fn cmd_add(ctx: &CmdCtx, name: Option<String>, from: Option<String>) -> Result<(
     };
 
     println!("creating worktree at {}", display_path(&path));
-    opened.backend.add(&path, strategy)?;
+    opened.primary().add(&path, strategy)?;
 
     let post = &loaded.config.hooks.post_create;
     if !post.is_empty() {
@@ -833,7 +909,7 @@ fn cmd_add(ctx: &CmdCtx, name: Option<String>, from: Option<String>) -> Result<(
 
 fn cmd_cd(ctx: &CmdCtx, name: Option<String>) -> Result<()> {
     let opened = open_repo_backend(ctx)?;
-    let worktrees = opened.backend.list()?;
+    let worktrees = opened.list_all()?;
     let picked = picker::resolve(
         &worktrees,
         name.as_deref(),
@@ -889,7 +965,7 @@ fn cmd_remove(ctx: &CmdCtx, name: Option<String>) -> Result<()> {
     let mut engine = Engine::new();
     let loaded = config::Config::load_with_engine(Some(&opened.repo.root), &mut engine)?;
 
-    let worktrees = opened.backend.list()?;
+    let worktrees = opened.list_all()?;
     let picked =
         picker::resolve(&worktrees, name.as_deref(), ctx.non_interactive, "remove:")?.clone();
 
@@ -903,8 +979,7 @@ fn cmd_remove(ctx: &CmdCtx, name: Option<String>) -> Result<()> {
     let pre = &loaded.config.hooks.pre_remove;
     if !pre.is_empty() {
         let branch = picked.branch.clone().unwrap_or_else(|| picked.name.clone());
-        let vcs_ctx =
-            layout::discover_vcs_context(opened.backend.as_ref(), &opened.repo.root, &branch);
+        let vcs_ctx = layout::discover_vcs_context(opened.primary(), &opened.repo.root, &branch);
         let base_ctx = system_context();
         let mut hr = hooks::HookRun {
             repo_root: &opened.repo.root,
@@ -917,8 +992,18 @@ fn cmd_remove(ctx: &CmdCtx, name: Option<String>) -> Result<()> {
         hooks::run_all(pre, &mut hr)?;
     }
 
+    // Dispatch to the backend that produced this row. In a colocated repo,
+    // a `git worktree remove` against a jj workspace (or vice versa) would
+    // either fail or hit the wrong store; the per-row tag is what makes
+    // the union safe to act on.
+    let backend = opened.backend_for(picked.vcs).ok_or_else(|| {
+        anyhow::anyhow!(
+            "internal: row tagged {:?} but no matching backend is open",
+            picked.vcs
+        )
+    })?;
     println!("removing {}", display_path(&picked.path));
-    opened.backend.remove(&picked.path, false)?;
+    backend.remove(&picked.path, false)?;
     Ok(())
 }
 
@@ -928,7 +1013,7 @@ fn cmd_exec(ctx: &CmdCtx, name: Option<String>, argv: Vec<String>) -> Result<()>
     }
 
     let opened = open_repo_backend(ctx)?;
-    let worktrees = opened.backend.list()?;
+    let worktrees = opened.list_all()?;
     let picked = picker::resolve(&worktrees, name.as_deref(), ctx.non_interactive, "exec in:")?;
 
     let status = std::process::Command::new(&argv[0])
@@ -969,24 +1054,86 @@ const INIT_TEMPLATE: &str = r#"# renri.toml
 
 fn cmd_prune(ctx: &CmdCtx) -> Result<()> {
     let opened = open_repo_backend(ctx)?;
-    let output = opened.backend.prune()?;
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
+    // Run prune on every open backend. Per-backend failure is logged and
+    // the loop continues — pruning is best-effort (matches the existing
+    // resilience policy for `prune` in CLAUDE.md), and a busted jj
+    // shouldn't prevent git-side cleanup. But if *every* backend fails
+    // we can't honestly say "nothing to prune", so bail at the end.
+    let mut any_output = false;
+    let mut any_success = false;
+    let mut any_failure = false;
+    let label_each = opened.is_multi();
+    for (kind, backend) in &opened.backends {
+        match backend.prune() {
+            Ok(output) => {
+                any_success = true;
+                let trimmed = output.trim();
+                if !trimmed.is_empty() {
+                    if label_each {
+                        println!("[{}] {trimmed}", vcs::kind_short(*kind));
+                    } else {
+                        println!("{trimmed}");
+                    }
+                    any_output = true;
+                }
+            }
+            Err(e) => {
+                any_failure = true;
+                tracing::error!(backend = backend.name(), error = %e, "prune failed");
+                eprintln!("[{}] prune failed: {e}", vcs::kind_short(*kind));
+            }
+        }
+    }
+    if any_failure && !any_success {
+        anyhow::bail!("prune failed on every backend");
+    }
+    if !any_output && !any_failure {
         println!("nothing to prune");
-    } else {
-        println!("{trimmed}");
     }
     Ok(())
 }
 
 fn cmd_sync(ctx: &CmdCtx) -> Result<()> {
     let opened = open_repo_backend(ctx)?;
-    let output = opened.backend.fetch()?;
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
+    // Fetch from every open backend. In a colocated repo `git fetch` and
+    // `jj git fetch` both reach into the same git store, but they update
+    // jj-bookmarks vs git-refs through different code paths so calling
+    // both is the safe thing to keep both views consistent.
+    //
+    // Bail when *every* backend errors so shell wrappers like
+    // `renri sync && deploy` get a non-zero exit instead of running
+    // deploy on a fully-failed fetch (the previous single-backend
+    // implementation propagated failure via `?`).
+    let mut any_output = false;
+    let mut any_success = false;
+    let mut any_failure = false;
+    let label_each = opened.is_multi();
+    for (kind, backend) in &opened.backends {
+        match backend.fetch() {
+            Ok(output) => {
+                any_success = true;
+                let trimmed = output.trim();
+                if !trimmed.is_empty() {
+                    if label_each {
+                        println!("[{}] {trimmed}", vcs::kind_short(*kind));
+                    } else {
+                        println!("{trimmed}");
+                    }
+                    any_output = true;
+                }
+            }
+            Err(e) => {
+                any_failure = true;
+                tracing::error!(backend = backend.name(), error = %e, "fetch failed");
+                eprintln!("[{}] fetch failed: {e}", vcs::kind_short(*kind));
+            }
+        }
+    }
+    if any_failure && !any_success {
+        anyhow::bail!("fetch failed on every backend");
+    }
+    if !any_output && !any_failure {
         println!("fetched (nothing changed)");
-    } else {
-        println!("{trimmed}");
     }
     Ok(())
 }
