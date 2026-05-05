@@ -412,11 +412,9 @@ fn cmd_list(ctx: &CmdCtx, refresh: bool) -> Result<()> {
         .map(|w| {
             let mut r = ListRow::from(w);
             if show_pr {
-                if let Some(branch) = w.branch.as_deref() {
-                    if let Some(pr) = prs.get(branch) {
-                        r.pr = Some(format!("#{}", pr.number));
-                        r.pr_state = Some(pr.state.clone());
-                    }
+                if let Some(pr) = pr_cache::lookup_for_worktree(w, &prs) {
+                    r.pr = Some(format!("#{}", pr.number));
+                    r.pr_state = Some(pr.state.clone());
                 }
             }
             r

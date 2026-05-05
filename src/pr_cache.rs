@@ -22,6 +22,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::vcs::Worktree;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrInfo {
     pub number: u64,
@@ -71,6 +73,29 @@ pub fn load_or_refresh(
     read_cache(&path)
         .map(|c| index_by_branch(c.prs))
         .unwrap_or_default()
+}
+
+/// Look up a PR for a worktree row, trying the bookmark / branch first
+/// and falling back to the workspace (or worktree) name.
+///
+/// **Why the fallback**: when a PR merges and GitHub deletes the head
+/// branch, `jj git fetch` removes the local remote-tracking bookmark.
+/// The jj workspace's `@`-commit then has no bookmark, so `Worktree::branch`
+/// becomes `None` and the obvious lookup misses — even though the cache
+/// still remembers the PR by its `head_ref_name`. renri's `add <n>`
+/// always names the workspace and bookmark identically, so `Worktree::name`
+/// is a reliable second key. Branch wins when both match (the user may
+/// have intentionally moved the bookmark to a different name).
+pub fn lookup_for_worktree<'a>(
+    w: &Worktree,
+    prs: &'a HashMap<String, PrInfo>,
+) -> Option<&'a PrInfo> {
+    if let Some(branch) = w.branch.as_deref() {
+        if let Some(pr) = prs.get(branch) {
+            return Some(pr);
+        }
+    }
+    prs.get(w.name.as_str())
 }
 
 fn index_by_branch(prs: Vec<PrInfo>) -> HashMap<String, PrInfo> {
@@ -207,5 +232,70 @@ mod tests {
             .as_secs();
         assert!(is_stale(now.saturating_sub(2 * 3600), 1));
         assert!(!is_stale(now.saturating_sub(60), 24));
+    }
+
+    fn wt(name: &str, branch: Option<&str>) -> Worktree {
+        Worktree {
+            name: name.into(),
+            path: std::path::PathBuf::new(),
+            branch: branch.map(String::from),
+            head: None,
+            desc: None,
+            dirty: false,
+            conflict: false,
+            is_main: false,
+            is_bare: false,
+            is_stale: false,
+            is_locked: false,
+            vcs: crate::vcs::Kind::Jj,
+        }
+    }
+
+    fn pr(number: u64, state: &str, head: &str) -> PrInfo {
+        PrInfo {
+            number,
+            state: state.into(),
+            head_ref_name: head.into(),
+        }
+    }
+
+    #[test]
+    fn lookup_for_worktree_prefers_branch_when_present() {
+        let prs = index_by_branch(vec![pr(1, "OPEN", "feat-foo"), pr(2, "MERGED", "feat-bar")]);
+        // workspace was renamed: name = "feat-bar" (original), branch was
+        // moved to "feat-foo" intentionally. Branch wins.
+        let row = wt("feat-bar", Some("feat-foo"));
+        let found = lookup_for_worktree(&row, &prs).unwrap();
+        assert_eq!(found.number, 1);
+    }
+
+    #[test]
+    fn lookup_for_worktree_falls_back_to_name_when_branch_missing() {
+        // The actual UX bug: PR merged, branch deleted upstream, jj fetch
+        // dropped the local bookmark, so the workspace's @ has no
+        // bookmark → branch is None. The cache still has the merged PR
+        // keyed by the original head_ref_name == workspace name.
+        let prs = index_by_branch(vec![pr(19, "MERGED", "feat-discover-pj")]);
+        let row = wt("feat-discover-pj", None);
+        let found = lookup_for_worktree(&row, &prs).unwrap();
+        assert_eq!(found.number, 19);
+        assert_eq!(found.state, "MERGED");
+    }
+
+    #[test]
+    fn lookup_for_worktree_falls_back_when_branch_present_but_no_match() {
+        // Branch is set but doesn't match anything (e.g. anonymous local
+        // bookmark). Fall through to the name lookup.
+        let prs = index_by_branch(vec![pr(7, "OPEN", "feat-baz")]);
+        let row = wt("feat-baz", Some("some-other-bookmark"));
+        let found = lookup_for_worktree(&row, &prs).unwrap();
+        assert_eq!(found.number, 7);
+    }
+
+    #[test]
+    fn lookup_for_worktree_returns_none_when_neither_matches() {
+        let prs = index_by_branch(vec![pr(1, "OPEN", "feat-foo")]);
+        let row = wt("unrelated", None);
+        assert!(lookup_for_worktree(&row, &prs).is_none());
     }
 }
