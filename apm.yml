@@ -2,7 +2,7 @@
 # resolves to a tag matching this `version`. Bump it together with
 # Cargo.toml / Cargo.lock when releasing a new tag.
 name: renri
-version: 0.1.13
+version: 0.1.14
 description: 'Skill describing how to use the renri CLI — a unified manager for git
 
   worktrees and jujutsu workspaces, configured via teravars-powered TOML.
