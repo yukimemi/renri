@@ -41,7 +41,11 @@ pub fn discover_vcs_context(backend: &dyn Backend, repo_root: &Path, branch: &st
         .unwrap_or("repo")
         .to_string();
     VcsContext {
-        owner: whoami::username(),
+        // whoami 2.x returns `Result<String, Error>` (was `String` in 1.x).
+        // Fall back to a literal `"unknown"` rather than panicking — this
+        // path is purely a layout-template helper and a missing username
+        // shouldn't fail the whole command.
+        owner: whoami::username().unwrap_or_else(|_| "unknown".into()),
         repo,
         host: None,
         branch: branch.to_string(),
