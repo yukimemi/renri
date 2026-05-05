@@ -43,6 +43,8 @@ The wide-open opportunities `renri` is targeting:
 | `cd <name?>` | Print absolute path; intended for shell wrapper. | Fuzzy picker if `<name>` omitted. |
 | `exec <name?> -- <argv>` | Run command in a worktree. | Fuzzy picker if `<name>` omitted. |
 | `prune` | GC: removed dirs, jj-stale workspaces, broken `git worktree`. | n/a |
+| `gh-repo` | Print `<owner>/<repo>` for the current repo. | n/a |
+| `self-update` | Update the renri binary itself. | Interactive confirmation if no flags. |
 | `config` | Inspect / edit config. | n/a |
 
 **Interactive UX**: any required argument that's missing falls back to
