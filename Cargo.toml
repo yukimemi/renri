@@ -44,4 +44,4 @@ self_update = { version = "0.44", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-pretty_assertions = "1"
+pretty_assertions = "1.4.1"
