@@ -18,10 +18,10 @@
       "customType": "regex",
       "fileMatch": ["^\\.github/workflows/.+\\.template$"],
       "matchStrings": [
-        "uses:\\s*(?<depName>[\\w./-]+)@(?<currentValue>[\\w.-]+)"
+        "uses:\\s*[\"']?(?<depName>[\\w./-]+)@(?<currentValue>[\\w./-]+)[\"']?"
       ],
       "datasourceTemplate": "github-tags",
-      "description": "Pick up `uses:` action references inside .template workflow files (kata sources). Renovate's default github-actions manager only scans .yml/.yaml; .template is here so the source isn't auto-executed by GitHub Actions."
+      "description": "Pick up `uses:` action references inside .template workflow files (kata sources). Renovate's default github-actions manager only scans .yml/.yaml; .template is here so the source isn't auto-executed by GitHub Actions. Optional `[\"']?` wrappers around depName + currentValue accept bare, single-quoted, and double-quoted forms — all three are valid YAML for `uses:`."
     }
   ],
   "packageRules": [
