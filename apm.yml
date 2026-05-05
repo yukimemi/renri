@@ -1,17 +1,16 @@
-# Required-by-APM but intentionally static. yukimemi/* projects
-# are not APM publishers; this apm.yml exists only to install
-# agent skills that contributors want available while working on
-# this repo — currently the `renri` worktree skill.
+# renri is a publishable APM package — `apm install yukimemi/renri`
+# resolves to a tag matching this `version`. Bump it together with
+# Cargo.toml / Cargo.lock when releasing a new tag.
 name: renri
-version: 0.0.0
-description: |
-  Dev-consumer APM config for the renri repo. Pinned
-  to `#main` so `apm install --update` always pulls the latest
-  renri skill.
-author: yukimemi
+version: 0.1.15
+description: 'Skill describing how to use the renri CLI — a unified manager for git
+
+  worktrees and jujutsu workspaces, configured via teravars-powered TOML.
+
+  Install with `apm install yukimemi/renri` to make this skill available
+
+  to Copilot, Claude Code, Cursor, OpenCode, Codex, and Gemini at once.
+
+  '
 dependencies:
-  apm:
-    - yukimemi/renri#main
-  mcp: []
-includes: auto
-scripts: {}
+  apm: []

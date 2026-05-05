@@ -1,5 +1,5 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-05-05T15:51:22.5632083Z"
+applied_at = "2026-05-05T16:19:15.1383278Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
@@ -43,7 +43,14 @@ content_hash = "3670f70a2f0be4013926bab6e878b90a42ad64c17899080aef4d193b246fa390
 content_hash = "a472b7d29835466dfa5d9fe7dbceb69dd39736a5b05b1fbe5b2cd7726a63a025"
 
 [files."apm.yml"]
-content_hash = "8cbd952f2ba2c8161331ef0677ddd921da5fd47540167ca6728bb0fb00521674"
+content_hash = "825d6ded76bb31104a3eba141feac28e0109faad4ceb93ef739c22a9fec549db"
+# renri publishes its own APM skill, so apm.yml carries a real
+# bumping version + an empty `dependencies.apm: []` (NOT the
+# `0.0.0` placeholder + self-dependency the canonical pj-base
+# apm.yml.tera would inject). once_applied + a future pj-base
+# `when = "once"` for apm.yml.tera let renri's publisher
+# manifest survive subsequent `kata apply` runs.
+once_applied = true
 
 [files."clippy.toml"]
 content_hash = "89dbb3b4fd63c479f61f077d2383ab5c0998ea838f271ed57fd09281975deda0"
