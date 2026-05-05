@@ -14,7 +14,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use super::{AddBranch, Backend, Worktree};
+use super::{AddBranch, Backend, Kind, Worktree};
 
 pub struct JjBackend {
     root: PathBuf,
@@ -250,6 +250,7 @@ impl Backend for JjBackend {
                 is_bare: false,
                 is_stale,
                 is_locked: false,
+                vcs: Kind::Jj,
             });
         }
 

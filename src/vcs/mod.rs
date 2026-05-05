@@ -50,6 +50,14 @@ pub struct Worktree {
     /// workspace, needs `update-stale`).
     pub is_stale: bool,
     pub is_locked: bool,
+    /// Which backend produced this row. Used by the CLI to dispatch
+    /// per-row operations (e.g. `remove`) back to the right backend in a
+    /// colocated repo where `list` unions both sides.
+    ///
+    /// Always `Kind::Git` for [`git::GitBackend`] and `Kind::Jj` for
+    /// [`jj::JjBackend`] — `Kind::Colocated` is never produced because a
+    /// single row always comes from exactly one of the two stores.
+    pub vcs: Kind,
 }
 
 /// How a worktree should be hooked up to a branch when adding it.
@@ -116,19 +124,30 @@ pub trait Backend {
     }
 }
 
-/// Pick which backend to use given the detected repo kind and the user's
-/// `--vcs` override.
-pub fn select_kind(repo_kind: Kind, choice: VcsChoice) -> Result<Kind> {
+/// Pick the set of backends to query given the detected repo kind and the
+/// user's `--vcs` override.
+///
+/// Returns 1 element in every case except colocated + Auto, which returns
+/// `[Jj, Git]` so verbs that union (`list`, `prune`, `sync`) can surface
+/// both sets and verbs that need a single primary (`add`, `config show`)
+/// can take `[0]` and get jj — matching the long-standing jj-priority
+/// policy for colocated repos.
+///
+/// **Why two backends here**: in colocated repos, `git worktree add` and
+/// `jj workspace add` create independent secondary checkouts that don't
+/// see each other (jj-vcs/jj#8052 — secondary colocation isn't supported).
+/// Showing only one side hides the other from list/prune and surprises
+/// users into thinking worktrees vanished.
+pub fn select_kinds(repo_kind: Kind, choice: VcsChoice) -> Result<Vec<Kind>> {
     match (repo_kind, choice) {
-        (_, VcsChoice::Auto) => Ok(match repo_kind {
-            // Colocated repos default to jj — the jj working-copy semantics
-            // are the user's source of truth.
-            Kind::Colocated => Kind::Jj,
-            other => other,
-        }),
+        (Kind::Git, VcsChoice::Auto) => Ok(vec![Kind::Git]),
+        (Kind::Jj, VcsChoice::Auto) => Ok(vec![Kind::Jj]),
+        // jj first so single-primary callers (cmd_add, cmd_config_show)
+        // get the same backend the in-repo policy has always used.
+        (Kind::Colocated, VcsChoice::Auto) => Ok(vec![Kind::Jj, Kind::Git]),
 
-        (Kind::Git, VcsChoice::Git) | (Kind::Colocated, VcsChoice::Git) => Ok(Kind::Git),
-        (Kind::Jj, VcsChoice::Jj) | (Kind::Colocated, VcsChoice::Jj) => Ok(Kind::Jj),
+        (Kind::Git, VcsChoice::Git) | (Kind::Colocated, VcsChoice::Git) => Ok(vec![Kind::Git]),
+        (Kind::Jj, VcsChoice::Jj) | (Kind::Colocated, VcsChoice::Jj) => Ok(vec![Kind::Jj]),
 
         (Kind::Git, VcsChoice::Jj) => bail!(
             "this repo is git-managed but --vcs jj was forced; \
@@ -137,6 +156,26 @@ pub fn select_kind(repo_kind: Kind, choice: VcsChoice) -> Result<Kind> {
         (Kind::Jj, VcsChoice::Git) => {
             bail!("this repo is jj-managed (no .git/) but --vcs git was forced")
         }
+    }
+}
+
+/// Convenience wrapper for callers that want a single backend (commands
+/// that operate on one worktree at a time: `add`, `config show`,
+/// `gh-repo`). Returns the first element of [`select_kinds`] — for
+/// colocated + Auto that is jj.
+pub fn select_kind(repo_kind: Kind, choice: VcsChoice) -> Result<Kind> {
+    Ok(select_kinds(repo_kind, choice)?[0])
+}
+
+/// Short label for a backend kind, used in pickers and the `list`
+/// VCS column. `Colocated` should never appear on a [`Worktree`] (rows
+/// always come from exactly one of the two stores), but we render it as
+/// `?` rather than panicking to keep the UI honest.
+pub fn kind_short(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Git => "git",
+        Kind::Jj => "jj",
+        Kind::Colocated => "?",
     }
 }
 
@@ -184,5 +223,54 @@ mod tests {
     fn select_rejects_incompatible_overrides() {
         assert!(select_kind(Kind::Git, VcsChoice::Jj).is_err());
         assert!(select_kind(Kind::Jj, VcsChoice::Git).is_err());
+    }
+
+    #[test]
+    fn select_kinds_passthrough_for_pure_kinds() {
+        assert_eq!(
+            select_kinds(Kind::Git, VcsChoice::Auto).unwrap(),
+            vec![Kind::Git]
+        );
+        assert_eq!(
+            select_kinds(Kind::Jj, VcsChoice::Auto).unwrap(),
+            vec![Kind::Jj]
+        );
+    }
+
+    #[test]
+    fn select_kinds_returns_both_for_colocated_auto() {
+        // jj first so primary() lands on jj per the long-standing policy.
+        assert_eq!(
+            select_kinds(Kind::Colocated, VcsChoice::Auto).unwrap(),
+            vec![Kind::Jj, Kind::Git]
+        );
+    }
+
+    #[test]
+    fn select_kinds_narrows_under_explicit_override() {
+        assert_eq!(
+            select_kinds(Kind::Colocated, VcsChoice::Git).unwrap(),
+            vec![Kind::Git]
+        );
+        assert_eq!(
+            select_kinds(Kind::Colocated, VcsChoice::Jj).unwrap(),
+            vec![Kind::Jj]
+        );
+    }
+
+    #[test]
+    fn select_kinds_rejects_incompatible_overrides() {
+        assert!(select_kinds(Kind::Git, VcsChoice::Jj).is_err());
+        assert!(select_kinds(Kind::Jj, VcsChoice::Git).is_err());
+    }
+
+    #[test]
+    fn select_kind_compat_shim_picks_jj_for_colocated_auto() {
+        // The single-backend wrapper must keep returning jj so cmd_add etc.
+        // don't change behavior in colocated repos.
+        assert_eq!(
+            select_kind(Kind::Colocated, VcsChoice::Auto).unwrap(),
+            Kind::Jj
+        );
     }
 }

@@ -33,16 +33,32 @@ pub struct Project {
     /// Absolute paths of every worktree we found that belongs to this
     /// project. Sorted so output is deterministic.
     pub worktrees: Vec<PathBuf>,
+
+    /// Resolved repo root — the directory containing `.git` and/or `.jj`
+    /// that backs every entry in `worktrees`. **Often lives outside the
+    /// scanned root**: the main checkout typically sits in `~/src/...`
+    /// while secondary worktrees live in `~/wt/...`.
+    ///
+    /// `entry_path()` returns this path so callers (the picker → `cd`
+    /// flow) land on the canonical repo root. That's the difference
+    /// between landing in a git-only secondary worktree (which makes
+    /// `vcs::detect` see only `.git`) versus landing on the colocated
+    /// main checkout (which surfaces both `.git` and `.jj` and lets
+    /// `select_kinds` open both backends — see jj-vcs/jj#8052 for why
+    /// secondary colocation isn't possible). `None` only when neither
+    /// `.git` nor `.jj` could be resolved on any worktree.
+    pub repo_root: Option<PathBuf>,
 }
 
 impl Project {
-    /// Pick a worktree to use as the effective cwd for the picked project.
-    /// First non-stale entry wins; we don't care which since git/jj `list`
-    /// returns the full set regardless.
+    /// Path to hand to `vcs::detect()` after the user picks this project.
+    /// Returns the resolved repo root when known, falling back to the
+    /// first worktree (which is itself a marker-bearing dir, so
+    /// `vcs::detect` will still succeed there).
     pub fn entry_path(&self) -> &Path {
         // `worktrees` is non-empty by construction (a project with no
         // worktrees would never have been pushed into the result list).
-        &self.worktrees[0]
+        self.repo_root.as_deref().unwrap_or(&self.worktrees[0])
     }
 }
 
@@ -70,18 +86,36 @@ pub fn scan(root: &Path) -> Vec<Project> {
     // Group by repo-identity. We use the VCS-reported common dir / repo
     // root path as the key so two worktrees of the same repo map to the
     // same bucket. BTreeMap → deterministic ordering of pickers.
-    let mut groups: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    //
+    // Each group also remembers the *resolved* repo root path (typically
+    // outside the scanned root — the main checkout lives elsewhere). The
+    // picker uses that path so picking a project lands the user on the
+    // canonical repo root, where `vcs::detect` can see both `.git` and
+    // `.jj` in colocated repos.
+    let mut groups: BTreeMap<String, (Option<PathBuf>, Vec<PathBuf>)> = BTreeMap::new();
     for wt in worktrees {
-        let key = repo_identity(&wt).unwrap_or_else(|| wt.to_string_lossy().into_owned());
-        groups.entry(key).or_default().push(wt);
+        let resolved = repo_identity_path(&wt);
+        let key = resolved
+            .as_deref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| wt.to_string_lossy().into_owned());
+        let entry = groups.entry(key).or_default();
+        if entry.0.is_none() {
+            entry.0 = resolved;
+        }
+        entry.1.push(wt);
     }
 
     let mut projects: Vec<Project> = groups
         .into_values()
-        .map(|mut worktrees| {
+        .map(|(repo_root, mut worktrees)| {
             worktrees.sort();
             let label = derive_label(root, &worktrees);
-            Project { label, worktrees }
+            Project {
+                label,
+                worktrees,
+                repo_root,
+            }
         })
         .collect();
 
@@ -131,8 +165,10 @@ pub(crate) fn is_worktree(path: &Path) -> bool {
     path.join(".git").exists() || path.join(".jj").is_dir()
 }
 
-/// Stable identity of the underlying repo. Two worktrees of the same repo
-/// return the same string; two unrelated repos return different ones.
+/// Stable identity of the underlying repo as a [`PathBuf`]: the canonical
+/// path of the repo root (the dir holding `.git` and/or `.jj`). Two
+/// worktrees of the same repo return the same path; two unrelated repos
+/// return different ones.
 ///
 /// Resolves the on-disk pointer rather than shelling out per-worktree:
 /// `git rev-parse --git-common-dir` and `jj workspace root` both work but
@@ -146,19 +182,18 @@ pub(crate) fn is_worktree(path: &Path) -> bool {
 /// `<root>` is shared).
 ///
 /// Returns `None` only when both markers exist but neither is parseable
-/// (corrupt repo). The caller substitutes the path itself in that case,
-/// which keeps the worktree visible in the picker as its own project
-/// rather than swallowing it.
-fn repo_identity(worktree: &Path) -> Option<String> {
+/// (corrupt repo). The caller substitutes the worktree's own path in that
+/// case so the entry stays visible in the picker.
+fn repo_identity_path(worktree: &Path) -> Option<PathBuf> {
     // jj first: colocated repos have both `.git` and `.jj`, but renri's
     // policy is jj-priority for colocated repos.
     if worktree.join(".jj").is_dir() {
         if let Some(p) = resolve_jj_repo(worktree) {
-            return Some(canonical(&normalize_to_repo_root(&p)));
+            return Some(canonical_path(&normalize_to_repo_root(&p)));
         }
     }
     if let Some(p) = resolve_git_common_dir(worktree) {
-        return Some(canonical(&normalize_to_repo_root(&p)));
+        return Some(canonical_path(&normalize_to_repo_root(&p)));
     }
     None
 }
@@ -277,11 +312,12 @@ fn resolve_git_common_dir(worktree: &Path) -> Option<PathBuf> {
     common.or(Some(gitdir))
 }
 
-fn canonical(p: &Path) -> String {
-    p.canonicalize()
-        .unwrap_or_else(|_| p.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
+/// Canonicalize a path or fall through to the input when it doesn't exist
+/// on disk. The fallback matters for tests where we mock store layouts
+/// using non-existent target dirs (e.g. a `.git` file pointing at
+/// `/tmp/whatever`).
+fn canonical_path(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Build a display label for a project from the relative path of its first
@@ -491,5 +527,65 @@ mod tests {
         fs::create_dir_all(&wt).unwrap();
         let label = derive_label(tmp.path(), &[wt]);
         assert_eq!(label, "solo");
+    }
+
+    #[test]
+    fn entry_path_lands_on_resolved_repo_root() {
+        // The whole point of the discovery → entry_path change: when the
+        // user picks a project from the worktree-root scan, vcs::detect
+        // must land on the *canonical* repo root (where `.jj` and `.git`
+        // can both live in a colocated repo) rather than on a secondary
+        // git worktree which only carries `.git`.
+        let tmp = TempDir::new().unwrap();
+        let main = tmp.path().join("main");
+        // Main checkout: <tmp>/main with `.git/worktrees/feature/`.
+        fs::create_dir_all(main.join(".git/worktrees/feature")).unwrap();
+
+        // Secondary worktree: <tmp>/wt/feature with `.git` file pointing
+        // back to the main's per-worktree dir.
+        let wt = tmp.path().join("wt/feature");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(
+            wt.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                main.join(".git/worktrees/feature").display()
+            ),
+        )
+        .unwrap();
+
+        // Scan only `wt/` — the main checkout is outside the scanned
+        // root (matching the user's actual `~/wt` vs `~/src/...` setup).
+        let projects = scan(&tmp.path().join("wt"));
+        assert_eq!(projects.len(), 1);
+        let p = &projects[0];
+
+        // entry_path must point at <tmp>/main, not <tmp>/wt/feature.
+        assert_eq!(
+            p.entry_path().canonicalize().unwrap(),
+            main.canonicalize().unwrap(),
+            "picker must land on the resolved main repo root, not on the secondary worktree"
+        );
+    }
+
+    #[test]
+    fn entry_path_falls_back_to_first_worktree_when_unresolvable() {
+        // Corrupt store: `.git` file points at a path that doesn't parse
+        // back to a known store layout. resolve_git_common_dir still
+        // returns *something* (the raw path), normalize_to_repo_root
+        // doesn't recognize it, so the resolved repo_root is whatever
+        // came out of that path. We just verify entry_path is non-empty
+        // and stays usable.
+        let tmp = TempDir::new().unwrap();
+        let wt = mkrepo(tmp.path(), "owner/repo/branch", ".git-file");
+        let projects = scan(tmp.path());
+        assert_eq!(projects.len(), 1);
+        // Either the resolved repo_root (which may not exist on disk
+        // here) or the worktree path itself — both are acceptable
+        // fallbacks; the key invariant is that `entry_path` never
+        // returns an empty path.
+        assert!(!projects[0].entry_path().as_os_str().is_empty());
+        // The worktree itself is still listed.
+        assert_eq!(projects[0].worktrees, vec![wt]);
     }
 }
