@@ -169,6 +169,23 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+
+    /// Open the GitHub PR for a worktree in the browser.
+    ///
+    /// Looks up the PR in the same on-disk cache `renri list` uses
+    /// (`<cache_dir>/renri/<owner>__<repo>/pr-cache.json`), so it
+    /// inherits whatever staleness the cache has. Pass `--refresh` to
+    /// force-refetch via `gh` first.
+    Pr {
+        /// Worktree name. If omitted, open a fuzzy picker over the
+        /// union of every backend's worktrees.
+        name: Option<String>,
+
+        /// Bypass the PR cache and re-fetch from GitHub via `gh` before
+        /// looking up. Mirrors `renri list --refresh`.
+        #[arg(long)]
+        refresh: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -235,6 +252,7 @@ fn main() -> Result<()> {
         Command::SelfUpdate { yes, check } => {
             updater::run_self_update(yes, check, ctx.non_interactive)
         }
+        Command::Pr { name, refresh } => cmd_pr(&ctx, name, refresh),
     };
 
     if let Some(handle) = update_check_handle {
@@ -388,18 +406,29 @@ fn cmd_list(ctx: &CmdCtx, refresh: bool) -> Result<()> {
     // colocated repos this lets the user tell at a glance which side a row
     // came from (the main concrete UX bug this column was added for).
     let show_vcs = opened.is_multi();
-    let prs = if show_pr {
+    // Resolve the GitHub identity of the repo once when the PR column
+    // is on. Held outside the cache lookup so the OSC 8 hyperlink path
+    // below can build PR URLs from the same owner/repo.
+    let vcs_ctx_for_pr = if show_pr {
         // Origin / branch are the same across both backends in a colocated
         // repo (they share the git store), so primary() is fine here.
         let branch = opened
             .primary()
             .current_branch()
             .unwrap_or_else(|| "main".into());
-        let vcs_ctx = layout::discover_vcs_context(opened.primary(), &opened.repo.root, &branch);
+        Some(layout::discover_vcs_context(
+            opened.primary(),
+            &opened.repo.root,
+            &branch,
+        ))
+    } else {
+        None
+    };
+    let prs = if let Some(ctx) = vcs_ctx_for_pr.as_ref() {
         pr_cache::load_or_refresh(
-            &vcs_ctx.owner,
-            &vcs_ctx.repo,
-            vcs_ctx.host.as_deref(),
+            &ctx.owner,
+            &ctx.repo,
+            ctx.host.as_deref(),
             loaded.config.ui.pr_cache_ttl_hours,
             refresh,
         )
@@ -415,6 +444,7 @@ fn cmd_list(ctx: &CmdCtx, refresh: bool) -> Result<()> {
                 if let Some(pr) = pr_cache::lookup_for_worktree(w, &prs) {
                     r.pr = Some(format!("#{}", pr.number));
                     r.pr_state = Some(pr.state.clone());
+                    r.pr_number = Some(pr.number);
                 }
             }
             r
@@ -519,6 +549,19 @@ fn cmd_list(ctx: &CmdCtx, refresh: bool) -> Result<()> {
                 (Some(n), _) => n.to_string(),
                 _ => "—".dimmed().to_string(),
             };
+            // Wrap real PRs in an OSC 8 hyperlink so terminals that
+            // support it (wezterm / kitty / iTerm2 / Windows Terminal /
+            // VTE) make `#42` Ctrl-clickable. Terminals that don't
+            // recognize the sequence drop it and render the cell as
+            // before. The padding goes OUTSIDE the hyperlink so the
+            // clickable region only covers the visible `#N`.
+            let pr_cell = match (row.pr_number, vcs_ctx_for_pr.as_ref()) {
+                (Some(n), Some(ctx)) if !ctx.owner.is_empty() && !ctx.repo.is_empty() => {
+                    let url = pr_cache::pr_url(ctx.host.as_deref(), &ctx.owner, &ctx.repo, n);
+                    pr_cache::osc8_hyperlink(&url, &pr_cell)
+                }
+                _ => pr_cell,
+            };
             let pr_raw_len = row.pr.as_deref().map_or(1, |s| s.chars().count());
             let pr_pad = " ".repeat(pr_w.saturating_sub(pr_raw_len));
             println!("{marker} {name}{name_pad}{vcs_cell}  {status}   {pr_cell}{pr_pad}  {desc}");
@@ -538,6 +581,10 @@ struct ListRow {
     conflict: bool,
     pr: Option<String>,
     pr_state: Option<String>,
+    /// Raw PR number (without `#`) used to build the OSC 8 hyperlink
+    /// URL. Held alongside `pr` so the renderer doesn't have to parse
+    /// `#42` back out of the display string.
+    pr_number: Option<u64>,
     vcs: vcs::Kind,
 }
 
@@ -552,6 +599,7 @@ impl From<&vcs::Worktree> for ListRow {
             conflict: w.conflict,
             pr: None,
             pr_state: None,
+            pr_number: None,
             vcs: w.vcs,
         }
     }
@@ -903,6 +951,116 @@ fn cmd_add(ctx: &CmdCtx, name: Option<String>, from: Option<String>) -> Result<(
 
     println!("done. {}", display_path(&path));
     Ok(())
+}
+
+fn cmd_pr(ctx: &CmdCtx, name: Option<String>, refresh: bool) -> Result<()> {
+    use renri::pr_cache;
+
+    let opened = open_repo_backend(ctx)?;
+    let worktrees = opened.list_all()?;
+    let picked = picker::resolve(
+        &worktrees,
+        name.as_deref(),
+        ctx.non_interactive,
+        "open PR for:",
+    )?;
+
+    // Resolve owner / repo / host from origin via the primary backend
+    // (origin is shared across both backends in a colocated repo).
+    let branch_for_ctx = picked.branch.clone().unwrap_or_else(|| picked.name.clone());
+    let vcs_ctx =
+        layout::discover_vcs_context(opened.primary(), &opened.repo.root, &branch_for_ctx);
+    if vcs_ctx.owner.is_empty() || vcs_ctx.repo.is_empty() {
+        anyhow::bail!(
+            "could not determine GitHub owner/repo from origin remote; \
+             `renri pr` only works on GitHub-hosted repos"
+        );
+    }
+
+    // Use the same on-disk PR cache `renri list` uses so behavior is
+    // consistent and we don't pay the gh-fork unless asked.
+    let loaded = config::Config::load(Some(&opened.repo.root)).unwrap_or_default();
+    let prs = pr_cache::load_or_refresh(
+        &vcs_ctx.owner,
+        &vcs_ctx.repo,
+        vcs_ctx.host.as_deref(),
+        loaded.config.ui.pr_cache_ttl_hours,
+        refresh,
+    );
+    let pr = pr_cache::lookup_for_worktree(picked, &prs).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no PR found for `{}` in the cache. \
+             try `renri pr {} --refresh` to re-fetch from GitHub, \
+             or check that the branch was actually pushed and a PR was opened.",
+            picked.name,
+            picked.name
+        )
+    })?;
+
+    let url = pr_cache::pr_url(
+        vcs_ctx.host.as_deref(),
+        &vcs_ctx.owner,
+        &vcs_ctx.repo,
+        pr.number,
+    );
+    eprintln!("opening PR #{} ({}) — {url}", pr.number, pr.state);
+    open_in_browser(&url)
+}
+
+/// Hand a URL off to the OS to open in the user's default browser.
+/// Uses platform-native commands so we don't add a dependency just for
+/// this one call: `rundll32 url.dll,FileProtocolHandler` on Windows
+/// (Microsoft's documented programmatic URL opener), `open` on macOS,
+/// `xdg-open` and friends on Linux.
+#[cfg(target_os = "windows")]
+fn open_in_browser(url: &str) -> Result<()> {
+    // `rundll32 url.dll,FileProtocolHandler <url>` is the documented
+    // way to open a URL with the user's default protocol handler
+    // without going through `cmd /C start`. Avoiding cmd means we
+    // don't have to think about cmd's metacharacter handling at all
+    // (e.g. an `&` in a query string getting interpreted as a command
+    // separator) — defensive even though `pr_cache::pr_url` only ever
+    // produces `https://github.com/<owner>/<repo>/pull/<number>`,
+    // none of which can contain shell-significant characters.
+    let status = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .status()
+        .with_context(|| format!("spawning `rundll32 url.dll,FileProtocolHandler {url}`"))?;
+    if !status.success() {
+        anyhow::bail!("failed to open `{url}` in browser");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_in_browser(url: &str) -> Result<()> {
+    let status = std::process::Command::new("open")
+        .arg(url)
+        .status()
+        .with_context(|| format!("spawning `open {url}`"))?;
+    if !status.success() {
+        anyhow::bail!("failed to open `{url}` in browser");
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_in_browser(url: &str) -> Result<()> {
+    // Try in order: xdg-open (most desktops), then gio open (newer
+    // GNOME), then wslview (WSL bridges to the host browser).
+    for opener in ["xdg-open", "gio", "wslview"] {
+        let mut cmd = std::process::Command::new(opener);
+        if opener == "gio" {
+            cmd.arg("open");
+        }
+        cmd.arg(url);
+        if let Ok(status) = cmd.status() {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!("no suitable URL opener found (install xdg-utils, or open manually): {url}");
 }
 
 fn cmd_cd(ctx: &CmdCtx, name: Option<String>) -> Result<()> {

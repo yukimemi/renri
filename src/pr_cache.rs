@@ -75,6 +75,29 @@ pub fn load_or_refresh(
         .unwrap_or_default()
 }
 
+/// Build a `https://github.com/<owner>/<repo>/pull/<number>` URL.
+///
+/// `host` is informational — only `github.com` is fetched (see
+/// [`load_or_refresh`]) and that's hardcoded in the URL prefix. When/if
+/// GitHub Enterprise support lands, swap the prefix on host. We keep the
+/// `host` parameter so the call site is honest about which value would
+/// be plugged in.
+pub fn pr_url(_host: Option<&str>, owner: &str, repo: &str, number: u64) -> String {
+    format!("https://github.com/{owner}/{repo}/pull/{number}")
+}
+
+/// Wrap `text` in OSC 8 hyperlink escape codes pointing at `url`.
+///
+/// OSC 8 (`ESC ] 8 ;; <url> ST <text> ESC ] 8 ;; ST`) is a terminal
+/// extension supported by wezterm, kitty, iTerm2, Windows Terminal,
+/// VTE-based terminals, and most modern emulators. Terminals that don't
+/// recognize the sequence silently drop it and render `text` plain — so
+/// it's safe to always emit. We use `\x1b\\` (ST) over `\x07` (BEL)
+/// because tmux is documented to handle ST correctly.
+pub fn osc8_hyperlink(url: &str, text: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
 /// Look up a PR for a worktree row, trying the bookmark / branch first
 /// and falling back to the workspace (or worktree) name.
 ///
@@ -297,5 +320,30 @@ mod tests {
         let prs = index_by_branch(vec![pr(1, "OPEN", "feat-foo")]);
         let row = wt("unrelated", None);
         assert!(lookup_for_worktree(&row, &prs).is_none());
+    }
+
+    #[test]
+    fn pr_url_builds_github_url() {
+        assert_eq!(
+            pr_url(Some("github.com"), "yukimemi", "renri", 27),
+            "https://github.com/yukimemi/renri/pull/27"
+        );
+        // host = None still produces the github.com URL — host is
+        // informational while we only support github.com.
+        assert_eq!(
+            pr_url(None, "yukimemi", "renri", 1),
+            "https://github.com/yukimemi/renri/pull/1"
+        );
+    }
+
+    #[test]
+    fn osc8_hyperlink_wraps_text_with_escape_codes() {
+        let s = osc8_hyperlink("https://example.com/x", "click");
+        assert!(s.starts_with("\x1b]8;;https://example.com/x\x1b\\"));
+        assert!(s.ends_with("click\x1b]8;;\x1b\\"));
+        // The visible text must be present uninterrupted between the two
+        // OSC 8 sequences so terminals that ignore the escape still show
+        // it correctly.
+        assert!(s.contains("\x1b\\click\x1b]8;;"));
     }
 }
