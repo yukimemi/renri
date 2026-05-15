@@ -1,7 +1,9 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/yukimemi/renri/main/assets/logo-dark.svg">
-  <img src="https://raw.githubusercontent.com/yukimemi/renri/main/assets/logo.svg" alt="renri — git worktrees + jj workspaces, unified" width="540">
-</picture>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/yukimemi/renri/main/assets/logo-dark.svg">
+    <img src="https://raw.githubusercontent.com/yukimemi/renri/main/assets/logo.svg" alt="renri — git worktrees + jj workspaces, unified" width="540">
+  </picture>
+</p>
 
 <p align="center">
   <a href="https://deepwiki.com/yukimemi/renri"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"/></a>
