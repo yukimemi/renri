@@ -1,7 +1,14 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/yukimemi/renri/main/assets/logo-dark.svg">
-  <img src="https://raw.githubusercontent.com/yukimemi/renri/main/assets/logo.svg" alt="renri — git worktrees + jj workspaces, unified" width="540">
-</picture>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/yukimemi/renri/main/assets/logo-dark.svg">
+    <img src="https://raw.githubusercontent.com/yukimemi/renri/main/assets/logo.svg" alt="renri — git worktrees + jj workspaces, unified" width="540">
+  </picture>
+</p>
+
+<p align="center">
+  <a href="https://deepwiki.com/yukimemi/renri"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"/></a>
+  <a href="https://codewiki.google/github.com/yukimemi/renri"><img src="https://img.shields.io/badge/View-Code_Wiki-4285F4?logo=google" alt="View Code Wiki"/></a>
+</p>
 
 > 連理 — *intertwined branches*. A unified manager for **git worktrees**
 > and **jujutsu (jj) workspaces**, driven by [teravars]-powered TOML
