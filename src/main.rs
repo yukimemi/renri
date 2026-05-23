@@ -81,10 +81,41 @@ enum Command {
     },
 
     /// Remove a worktree / forget a workspace.
+    ///
+    /// Prints a details panel (branch / HEAD / dirty / conflict / PR / …)
+    /// for every target before doing anything so the user can sanity-check
+    /// the choice; the panel is also what `--merged` uses to summarize a
+    /// batch. Pass `-y` to skip the confirmation prompt.
     #[command(alias = "rm")]
     Remove {
         /// Worktree name. If omitted, open a fuzzy picker.
+        /// Ignored when `--merged` is set.
         name: Option<String>,
+
+        /// Skip the interactive confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Pass `--force` to the underlying backend, allowing removal of
+        /// worktrees with uncommitted changes / conflicts. Also unblocks
+        /// dirty / conflict / locked rows in `--merged` mode (which
+        /// otherwise skips them).
+        #[arg(long, short = 'f')]
+        force: bool,
+
+        /// Remove every worktree whose GitHub PR is merged or closed.
+        /// Dirty / conflicted / locked / main rows are skipped with a
+        /// warning unless `--force` is also passed. Requires the `gh`
+        /// CLI and `[ui] show_pr = true` (or just a GitHub origin).
+        #[arg(long)]
+        merged: bool,
+
+        /// Bypass the PR cache and re-fetch from GitHub before reading
+        /// PR state. Useful both for single-target removes (the details
+        /// panel reflects current state) and `--merged` (the candidate
+        /// set reflects current state). Matches `renri list --refresh`.
+        #[arg(long)]
+        refresh: bool,
     },
 
     /// Print the absolute path of a worktree (designed to be used from a
@@ -226,7 +257,13 @@ fn main() -> Result<()> {
             sub: ConfigCommand::Show,
         } => cmd_config_show(&ctx),
         Command::Add { name, from } => cmd_add(&ctx, name, from),
-        Command::Remove { name } => cmd_remove(&ctx, name),
+        Command::Remove {
+            name,
+            yes,
+            force,
+            merged,
+            refresh,
+        } => cmd_remove(&ctx, name, yes, force, merged, refresh),
         Command::Cd { name } => cmd_cd(&ctx, name),
         Command::Exec { name, argv } => cmd_exec(&ctx, name, argv),
         Command::Prune => cmd_prune(&ctx),
@@ -1096,7 +1133,21 @@ fn pick_subshell() -> String {
     }
 }
 
-fn cmd_remove(ctx: &CmdCtx, name: Option<String>) -> Result<()> {
+fn cmd_remove(
+    ctx: &CmdCtx,
+    name: Option<String>,
+    yes: bool,
+    force: bool,
+    merged: bool,
+    refresh: bool,
+) -> Result<()> {
+    if merged {
+        if name.is_some() {
+            anyhow::bail!("--merged operates on the full list; pass either <name> or --merged");
+        }
+        return cmd_remove_merged(ctx, yes, force, refresh);
+    }
+
     let opened = open_repo_backend(ctx)?;
     let mut engine = Engine::new();
     let loaded = config::Config::load_with_engine(Some(&opened.repo.root), &mut engine)?;
@@ -1112,35 +1163,363 @@ fn cmd_remove(ctx: &CmdCtx, name: Option<String>) -> Result<()> {
         );
     }
 
-    let pre = &loaded.config.hooks.pre_remove;
-    if !pre.is_empty() {
-        let branch = picked.branch.clone().unwrap_or_else(|| picked.name.clone());
+    // Resolve VCS context once — used both for the PR lookup and (if pre_remove
+    // hooks exist) the hook runner. Lifting it above the PR fetch keeps the
+    // call sites in sync about which branch identifies the worktree.
+    let branch_for_ctx = picked.branch.clone().unwrap_or_else(|| picked.name.clone());
+    let vcs_ctx =
+        layout::discover_vcs_context(opened.primary(), &opened.repo.root, &branch_for_ctx);
+
+    // Best-effort PR lookup: even when `[ui] show_pr = false` we still try
+    // the cache so a user who has list-with-PRs configured elsewhere gets
+    // the same signal here. No `gh` / no cache → silently no PR info.
+    // `--refresh` forwards through so the details panel reflects current
+    // state, matching `renri list --refresh` semantics.
+    let prs = load_pr_cache_for_repo(&opened, &loaded.config, &vcs_ctx, refresh);
+    let pr_info = renri::pr_cache::lookup_for_worktree(&picked, &prs);
+    let pr_url = pr_info.map(|p| {
+        renri::pr_cache::pr_url(
+            vcs_ctx.host.as_deref(),
+            &vcs_ctx.owner,
+            &vcs_ctx.repo,
+            p.number,
+        )
+    });
+
+    println!();
+    print_worktree_details(&picked, pr_info, pr_url.as_deref());
+    println!();
+
+    if !yes && !confirm_remove(ctx, "remove this worktree?")? {
+        println!("aborted");
+        return Ok(());
+    }
+
+    remove_one(
+        &opened,
+        &picked,
+        &loaded.config.hooks.pre_remove,
+        &mut engine,
+        force,
+    )?;
+    Ok(())
+}
+
+/// Auto-remove every worktree whose GitHub PR is `MERGED` or `CLOSED`.
+///
+/// Hard skips: the main worktree, and (unless `--force`) anything dirty /
+/// conflicted / locked. Those land in a warning block printed before the
+/// summary so the user knows what was *not* swept.
+///
+/// Bails before touching anything when (a) the repo's origin isn't on
+/// GitHub, (b) the PR cache is empty (no `gh`, or genuinely no PRs), or
+/// (c) `--non-interactive` is set without `--yes`.
+fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool, refresh: bool) -> Result<()> {
+    use owo_colors::OwoColorize;
+    use renri::pr_cache;
+
+    let opened = open_repo_backend(ctx)?;
+    let mut engine = Engine::new();
+    let loaded = config::Config::load_with_engine(Some(&opened.repo.root), &mut engine)?;
+
+    let worktrees = opened.list_all()?;
+    if worktrees.is_empty() {
+        println!("no worktrees");
+        return Ok(());
+    }
+
+    let branch = opened
+        .primary()
+        .current_branch()
+        .unwrap_or_else(|| "main".into());
+    let vcs_ctx = layout::discover_vcs_context(opened.primary(), &opened.repo.root, &branch);
+    if vcs_ctx.owner.is_empty() || vcs_ctx.repo.is_empty() {
+        anyhow::bail!(
+            "could not determine GitHub owner/repo from origin remote; \
+             --merged only works on GitHub-hosted repos"
+        );
+    }
+
+    // Empty `prs` is ambiguous (no `gh` / network failure / genuinely zero
+    // open PRs), so we deliberately don't bail here. The downstream
+    // "nothing to remove" message after candidate filtering is accurate
+    // either way, and conflating "tool missing" with "no PRs to act on"
+    // produces misleading errors in a fresh repo.
+    let prs = load_pr_cache_for_repo(&opened, &loaded.config, &vcs_ctx, refresh);
+
+    let mut candidates: Vec<(vcs::Worktree, pr_cache::PrInfo, String)> = Vec::new();
+    let mut skipped: Vec<(vcs::Worktree, Option<pr_cache::PrInfo>, String)> = Vec::new();
+    for w in worktrees.iter() {
+        if w.is_main {
+            // main is never a remove candidate — skip silently so it
+            // doesn't clutter the warning block in every run.
+            continue;
+        }
+        let Some(pr) = pr_cache::lookup_for_worktree(w, &prs) else {
+            continue;
+        };
+        if pr.state != "MERGED" && pr.state != "CLOSED" {
+            continue;
+        }
+        let mut reasons: Vec<&str> = Vec::new();
+        if !force {
+            if w.dirty {
+                reasons.push("dirty");
+            }
+            if w.conflict {
+                reasons.push("conflict");
+            }
+            if w.is_locked {
+                reasons.push("locked");
+            }
+        }
+        let url = pr_cache::pr_url(
+            vcs_ctx.host.as_deref(),
+            &vcs_ctx.owner,
+            &vcs_ctx.repo,
+            pr.number,
+        );
+        if reasons.is_empty() {
+            candidates.push((w.clone(), pr.clone(), url));
+        } else {
+            skipped.push((w.clone(), Some(pr.clone()), reasons.join(",")));
+        }
+    }
+
+    if !skipped.is_empty() {
+        eprintln!("{} (pass --force to include):", "skipping".yellow().bold());
+        for (w, pr, reasons) in &skipped {
+            let pr_label = pr
+                .as_ref()
+                .map(|p| format!("#{} {}", p.number, p.state))
+                .unwrap_or_else(|| "(no PR)".to_string());
+            eprintln!("  {} {} — {}", w.name, pr_label.dimmed(), reasons.yellow());
+        }
+        eprintln!();
+    }
+
+    if candidates.is_empty() {
+        println!("nothing to remove (no merged/closed PRs with a removable worktree)");
+        return Ok(());
+    }
+
+    println!(
+        "{} {} worktree(s) match merged/closed PRs:",
+        "found".green().bold(),
+        candidates.len()
+    );
+    for (w, pr, url) in &candidates {
+        println!();
+        print_worktree_details(w, Some(pr), Some(url));
+    }
+    println!();
+
+    if !yes {
+        let n = candidates.len();
+        let plural = if n == 1 { "worktree" } else { "worktrees" };
+        let prompt = format!("remove {n} {plural}?");
+        if !confirm_remove(ctx, &prompt)? {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    for (w, pr, _url) in &candidates {
+        println!(
+            "removing {} ({} {})",
+            w.name,
+            format!("#{}", pr.number).dimmed(),
+            pr.state.dimmed()
+        );
+        match remove_one(
+            &opened,
+            w,
+            &loaded.config.hooks.pre_remove,
+            &mut engine,
+            force,
+        ) {
+            Ok(()) => ok += 1,
+            Err(e) => {
+                eprintln!("  {}: {e}", "failed".red().bold());
+                failed += 1;
+            }
+        }
+    }
+    println!(
+        "done — removed {}, failed {}",
+        ok.to_string().green(),
+        if failed == 0 {
+            failed.to_string().dimmed().to_string()
+        } else {
+            failed.to_string().red().to_string()
+        }
+    );
+    if failed > 0 {
+        anyhow::bail!("{failed} removal(s) failed");
+    }
+    Ok(())
+}
+
+/// Pretty-print everything we know about a worktree, structured like a
+/// short YAML block. Used by both the single-pick and `--merged` flows so
+/// the user sees the same shape of info either way.
+fn print_worktree_details(
+    w: &vcs::Worktree,
+    pr: Option<&renri::pr_cache::PrInfo>,
+    pr_url: Option<&str>,
+) {
+    use owo_colors::OwoColorize;
+
+    let label = |s: &str| format!("  {:>9}:", s.dimmed());
+
+    let name_styled = if w.is_main {
+        w.name.green().bold().to_string()
+    } else if w.is_stale {
+        w.name.yellow().to_string()
+    } else {
+        w.name.clone()
+    };
+    println!("{} {}", label("name"), name_styled);
+
+    if let Some(b) = &w.branch {
+        println!("{} {}", label("branch"), b);
+    } else {
+        println!(
+            "{} {}",
+            label("branch"),
+            "(detached / no bookmark)".dimmed()
+        );
+    }
+
+    println!("{} {}", label("path"), display_path(&w.path));
+    println!("{} {}", label("vcs"), vcs::kind_short(w.vcs));
+
+    match (&w.head, &w.desc) {
+        (Some(h), Some(d)) => println!("{} {} {}", label("head"), h, d.dimmed()),
+        (Some(h), None) => println!("{} {}", label("head"), h),
+        (None, _) => println!("{} {}", label("head"), "(unknown)".dimmed()),
+    }
+
+    let mut flags: Vec<String> = Vec::new();
+    if w.is_main {
+        flags.push("main".green().to_string());
+    }
+    if w.is_stale {
+        flags.push("stale".yellow().to_string());
+    }
+    if w.dirty {
+        flags.push("dirty".yellow().to_string());
+    }
+    if w.conflict {
+        flags.push("conflict".red().bold().to_string());
+    }
+    if w.is_locked {
+        flags.push("locked".yellow().to_string());
+    }
+    if w.is_bare {
+        flags.push("bare".dimmed().to_string());
+    }
+    if flags.is_empty() {
+        flags.push("clean".green().to_string());
+    }
+    println!("{} {}", label("status"), flags.join(" "));
+
+    if let Some(pr) = pr {
+        let state_colored = match pr.state.as_str() {
+            "OPEN" => pr.state.green().to_string(),
+            "MERGED" => pr.state.magenta().to_string(),
+            "CLOSED" => pr.state.red().to_string(),
+            _ => pr.state.clone(),
+        };
+        let url_part = pr_url
+            .map(|u| format!("  {}", u.dimmed()))
+            .unwrap_or_default();
+        println!(
+            "{} #{} ({}){url_part}",
+            label("pr"),
+            pr.number,
+            state_colored
+        );
+    } else {
+        println!("{} {}", label("pr"), "(none)".dimmed());
+    }
+}
+
+/// Wrap `inquire::Confirm` so the call sites stay readable and the
+/// non-interactive policy lives in exactly one place: `--non-interactive`
+/// without `--yes` is a hard error rather than a silent abort, because
+/// proceeding would skip the safety prompt we explicitly want to enforce.
+fn confirm_remove(ctx: &CmdCtx, prompt: &str) -> Result<bool> {
+    if ctx.non_interactive {
+        anyhow::bail!("--non-interactive set; pass --yes to confirm the removal");
+    }
+    inquire::Confirm::new(prompt)
+        .with_default(false)
+        .prompt()
+        .context("confirmation prompt cancelled")
+}
+
+/// Run pre_remove hooks then dispatch the backend's remove. Factored out
+/// of `cmd_remove` so the `--merged` loop can reuse it without diverging
+/// on hook semantics (a single hook spec applies to every removal).
+fn remove_one(
+    opened: &OpenedRepo,
+    w: &vcs::Worktree,
+    pre_hooks: &[config::HookSpec],
+    engine: &mut Engine,
+    force: bool,
+) -> Result<()> {
+    if !pre_hooks.is_empty() {
+        let branch = w.branch.clone().unwrap_or_else(|| w.name.clone());
         let vcs_ctx = layout::discover_vcs_context(opened.primary(), &opened.repo.root, &branch);
         let base_ctx = system_context();
         let mut hr = hooks::HookRun {
             repo_root: &opened.repo.root,
-            worktree_path: &picked.path,
+            worktree_path: &w.path,
             vcs: &vcs_ctx,
-            engine: &mut engine,
+            engine,
             base_ctx: &base_ctx,
         };
-        println!("running {} pre_remove hook(s)", pre.len());
-        hooks::run_all(pre, &mut hr)?;
+        println!("running {} pre_remove hook(s)", pre_hooks.len());
+        hooks::run_all(pre_hooks, &mut hr)?;
     }
 
     // Dispatch to the backend that produced this row. In a colocated repo,
     // a `git worktree remove` against a jj workspace (or vice versa) would
     // either fail or hit the wrong store; the per-row tag is what makes
     // the union safe to act on.
-    let backend = opened.backend_for(picked.vcs).ok_or_else(|| {
+    let backend = opened.backend_for(w.vcs).ok_or_else(|| {
         anyhow::anyhow!(
             "internal: row tagged {:?} but no matching backend is open",
-            picked.vcs
+            w.vcs
         )
     })?;
-    println!("removing {}", display_path(&picked.path));
-    backend.remove(&picked.path, false)?;
+    println!("  → {}", display_path(&w.path));
+    backend.remove(&w.path, force)?;
     Ok(())
+}
+
+/// Wrap `pr_cache::load_or_refresh` so both the single-pick and `--merged`
+/// flows resolve PRs the same way. Returns an empty map when the repo
+/// isn't on GitHub or `gh` is missing — both flows handle that downstream.
+fn load_pr_cache_for_repo(
+    _opened: &OpenedRepo,
+    config: &config::Config,
+    vcs_ctx: &layout::VcsContext,
+    refresh: bool,
+) -> std::collections::HashMap<String, renri::pr_cache::PrInfo> {
+    if vcs_ctx.owner.is_empty() || vcs_ctx.repo.is_empty() {
+        return Default::default();
+    }
+    renri::pr_cache::load_or_refresh(
+        &vcs_ctx.owner,
+        &vcs_ctx.repo,
+        vcs_ctx.host.as_deref(),
+        config.ui.pr_cache_ttl_hours,
+        refresh,
+    )
 }
 
 fn cmd_exec(ctx: &CmdCtx, name: Option<String>, argv: Vec<String>) -> Result<()> {
