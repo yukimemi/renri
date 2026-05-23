@@ -110,8 +110,10 @@ enum Command {
         #[arg(long)]
         merged: bool,
 
-        /// Bypass the PR cache and re-fetch from GitHub. Only meaningful
-        /// with `--merged`; matches `renri list --refresh`.
+        /// Bypass the PR cache and re-fetch from GitHub before reading
+        /// PR state. Useful both for single-target removes (the details
+        /// panel reflects current state) and `--merged` (the candidate
+        /// set reflects current state). Matches `renri list --refresh`.
         #[arg(long)]
         refresh: bool,
     },
@@ -1145,9 +1147,6 @@ fn cmd_remove(
         }
         return cmd_remove_merged(ctx, yes, force, refresh);
     }
-    if refresh {
-        anyhow::bail!("--refresh only makes sense with --merged");
-    }
 
     let opened = open_repo_backend(ctx)?;
     let mut engine = Engine::new();
@@ -1174,7 +1173,9 @@ fn cmd_remove(
     // Best-effort PR lookup: even when `[ui] show_pr = false` we still try
     // the cache so a user who has list-with-PRs configured elsewhere gets
     // the same signal here. No `gh` / no cache → silently no PR info.
-    let prs = load_pr_cache_for_repo(&opened, &loaded.config, &vcs_ctx, false);
+    // `--refresh` forwards through so the details panel reflects current
+    // state, matching `renri list --refresh` semantics.
+    let prs = load_pr_cache_for_repo(&opened, &loaded.config, &vcs_ctx, refresh);
     let pr_info = renri::pr_cache::lookup_for_worktree(&picked, &prs);
     let pr_url = pr_info.map(|p| {
         renri::pr_cache::pr_url(
@@ -1239,13 +1240,12 @@ fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool, refresh: bool) -> Res
         );
     }
 
+    // Empty `prs` is ambiguous (no `gh` / network failure / genuinely zero
+    // open PRs), so we deliberately don't bail here. The downstream
+    // "nothing to remove" message after candidate filtering is accurate
+    // either way, and conflating "tool missing" with "no PRs to act on"
+    // produces misleading errors in a fresh repo.
     let prs = load_pr_cache_for_repo(&opened, &loaded.config, &vcs_ctx, refresh);
-    if prs.is_empty() {
-        anyhow::bail!(
-            "no PR data available — install the `gh` CLI and authenticate, \
-             then retry (optionally with --refresh)"
-        );
-    }
 
     let mut candidates: Vec<(vcs::Worktree, pr_cache::PrInfo, String)> = Vec::new();
     let mut skipped: Vec<(vcs::Worktree, Option<pr_cache::PrInfo>, String)> = Vec::new();
