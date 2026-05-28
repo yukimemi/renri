@@ -309,7 +309,7 @@ enum AutoUpdateHandle {
     /// A background check is currently in progress.
     Pending {
         checker: updater::Checker,
-        rx: std::sync::mpsc::Receiver<Result<kaishin::LatestRelease>>,
+        rx: std::sync::mpsc::Receiver<Result<Option<kaishin::LatestRelease>>>,
         /// A newer version already known from the local cache.
         cached_latest: Option<kaishin::LatestRelease>,
     },
@@ -370,12 +370,23 @@ fn finalize_auto_update_check(handle: AutoUpdateHandle) {
             cached_latest,
         } => {
             // Wait for 1 second.
+            // kaishin 0.4 で check_and_save が Option を返すようになったので、
+            // Ok(Ok(None)) = 「fetch 成功で更新無し」を区別できる。
             let res = rx.recv_timeout(std::time::Duration::from_secs(1));
-            if let Ok(Ok(latest)) = res {
-                eprintln!("\n{}", checker.format_banner(&latest));
-            } else if let Some(latest) = cached_latest {
-                // Fallback to cached version on timeout or fetch error.
-                eprintln!("\n{}", checker.format_banner(&latest));
+            match res {
+                Ok(Ok(Some(latest))) => {
+                    eprintln!("\n{}", checker.format_banner(&latest));
+                }
+                Ok(Ok(None)) => {
+                    // fetch は成功したがアップデート無し。 cache へのフォールバック
+                    // も不要（最新が現在版に追いついた直後など）。
+                }
+                _ => {
+                    // タイムアウトや fetch エラー時のみ cache を試す。
+                    if let Some(latest) = cached_latest {
+                        eprintln!("\n{}", checker.format_banner(&latest));
+                    }
+                }
             }
         }
     }

@@ -53,7 +53,7 @@ impl Checker {
         self.inner.should_check()
     }
 
-    pub fn check_and_save(&self) -> Result<kaishin::LatestRelease> {
+    pub fn check_and_save(&self) -> Result<Option<kaishin::LatestRelease>> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
