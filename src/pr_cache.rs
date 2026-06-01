@@ -109,6 +109,15 @@ pub fn osc8_hyperlink(url: &str, text: &str) -> String {
 /// always names the workspace and bookmark identically, so `Worktree::name`
 /// is a reliable second key. Branch wins when both match (the user may
 /// have intentionally moved the bookmark to a different name).
+///
+/// **Why the slash/dash normalization**: renri's default layout renders the
+/// worktree *path* with `vcs.branch | replace(from='/', to='-')`, so a
+/// workspace created from a dashed name (or by an older renri) is named e.g.
+/// `feat-x` while the GitHub PR head ref stays `feat/x`. Once that PR merges
+/// the bookmark is dropped (`branch` is `None`) and the exact name lookup
+/// above misses too — leaving the row with a blank PR column and invisible to
+/// `remove --merged`. When the exact keys miss we retry with `/` flattened to
+/// `-` on both sides so the merged PR is still found.
 pub fn lookup_for_worktree<'a>(
     w: &Worktree,
     prs: &'a HashMap<String, PrInfo>,
@@ -118,7 +127,54 @@ pub fn lookup_for_worktree<'a>(
             return Some(pr);
         }
     }
-    prs.get(w.name.as_str())
+    if let Some(pr) = prs.get(w.name.as_str()) {
+        return Some(pr);
+    }
+    lookup_normalized(w, prs)
+}
+
+/// Slash/dash-normalized fallback for [`lookup_for_worktree`]. Compares the
+/// worktree's branch / name against every PR head ref with `/` flattened to
+/// `-`. When several head refs collapse to the same normalized key, pick the
+/// best-ranked state (OPEN > MERGED > CLOSED), breaking ties by lower PR
+/// number so the choice is deterministic regardless of `HashMap` iteration
+/// order.
+fn lookup_normalized<'a>(w: &Worktree, prs: &'a HashMap<String, PrInfo>) -> Option<&'a PrInfo> {
+    // Compare allocation-free: this runs for every worktree row in `list`
+    // against up to 200 cached PRs, so we don't want a `String::replace` per
+    // iteration. `/` and `-` are ASCII, so they never appear inside a
+    // multi-byte UTF-8 sequence — byte-by-byte comparison with the two
+    // treated as equal is correct.
+    let eq_normalized = |a: &str, b: &str| {
+        a.len() == b.len()
+            && a.bytes().zip(b.bytes()).all(|(x, y)| {
+                let fold = |c: u8| if c == b'/' { b'-' } else { c };
+                fold(x) == fold(y)
+            })
+    };
+
+    let mut best: Option<&PrInfo> = None;
+    for pr in prs.values() {
+        let matches_branch = w
+            .branch
+            .as_deref()
+            .is_some_and(|b| eq_normalized(b, &pr.head_ref_name));
+        if !matches_branch && !eq_normalized(&w.name, &pr.head_ref_name) {
+            continue;
+        }
+        best = Some(match best {
+            None => pr,
+            Some(cur) => {
+                let (rank, cur_rank) = (state_rank(&pr.state), state_rank(&cur.state));
+                if rank < cur_rank || (rank == cur_rank && pr.number < cur.number) {
+                    pr
+                } else {
+                    cur
+                }
+            }
+        });
+    }
+    best
 }
 
 fn index_by_branch(prs: Vec<PrInfo>) -> HashMap<String, PrInfo> {
@@ -320,6 +376,62 @@ mod tests {
         let prs = index_by_branch(vec![pr(1, "OPEN", "feat-foo")]);
         let row = wt("unrelated", None);
         assert!(lookup_for_worktree(&row, &prs).is_none());
+    }
+
+    #[test]
+    fn lookup_for_worktree_normalizes_dash_name_to_slash_head_ref() {
+        // The real-world kanade bug: workspace named `feat-explode-spec-cache`
+        // (dashes, from renri's path layout / an older add), PR head ref is
+        // `feat/explode-spec-cache` (slash), and the bookmark is gone after
+        // merge so branch is None. The dashed name must still resolve to the
+        // merged PR via slash/dash normalization.
+        let prs = index_by_branch(vec![pr(120, "MERGED", "feat/explode-spec-cache")]);
+        let row = wt("feat-explode-spec-cache", None);
+        let found = lookup_for_worktree(&row, &prs).unwrap();
+        assert_eq!(found.number, 120);
+        assert_eq!(found.state, "MERGED");
+    }
+
+    #[test]
+    fn lookup_for_worktree_normalizes_via_dashed_branch_too() {
+        // Same normalization applies when the branch (bookmark) is present
+        // but dashed, e.g. a release worktree `release-v0.34.0` tracking a
+        // bookmark of the same dashed shape while the PR head ref is sliced.
+        let prs = index_by_branch(vec![pr(115, "MERGED", "release/v0.34.0")]);
+        let row = wt("release-v0.34.0", Some("release-v0.34.0"));
+        let found = lookup_for_worktree(&row, &prs).unwrap();
+        assert_eq!(found.number, 115);
+    }
+
+    #[test]
+    fn lookup_normalized_prefers_open_over_merged_on_collision() {
+        // Two distinct head refs collapse to the same normalized key
+        // (`feat-x`). Prefer the OPEN one so the row reflects live work.
+        let prs = index_by_branch(vec![pr(2, "MERGED", "feat/x"), pr(5, "OPEN", "feat-x")]);
+        let row = wt("feat-x", None);
+        let found = lookup_for_worktree(&row, &prs).unwrap();
+        assert_eq!(found.number, 5);
+        assert_eq!(found.state, "OPEN");
+    }
+
+    #[test]
+    fn lookup_normalized_breaks_state_ties_by_lower_number() {
+        // Both normalize to `feat-x` and are MERGED — lower PR number wins so
+        // the pick is stable across HashMap iteration order.
+        let prs = index_by_branch(vec![pr(9, "MERGED", "feat/x"), pr(3, "MERGED", "feat-x")]);
+        let row = wt("feat-x", None);
+        let found = lookup_for_worktree(&row, &prs).unwrap();
+        assert_eq!(found.number, 3);
+    }
+
+    #[test]
+    fn lookup_for_worktree_exact_match_wins_over_normalized() {
+        // An exact dashed head ref must not be shadowed by the normalized
+        // fallback: `feat-foo` resolves to its own PR, not a `feat/foo`.
+        let prs = index_by_branch(vec![pr(1, "OPEN", "feat-foo"), pr(2, "MERGED", "feat/foo")]);
+        let row = wt("feat-foo", None);
+        let found = lookup_for_worktree(&row, &prs).unwrap();
+        assert_eq!(found.number, 1);
     }
 
     #[test]
