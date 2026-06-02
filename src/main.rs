@@ -236,10 +236,30 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Spawn background update check if not running self-update or completions.
+    // A small multi-threaded tokio runtime drives the background auto-update as
+    // a spawned task that overlaps the command (mirrors rvpm). One worker is
+    // enough: the task is mostly network/IO-bound and is drained with a short,
+    // bounded timeout at shutdown. Built lazily so commands that never spawn an
+    // update (self-update / completions, or a disabled config) don't pay for
+    // it; `None` means we never needed a runtime.
+    let mut update_rt: Option<tokio::runtime::Runtime> = None;
     let update_check_handle = match cli.command {
         Command::SelfUpdate { .. } | Command::Completions { .. } => None,
-        _ => maybe_spawn_auto_update_check(),
+        _ => match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => {
+                let handle = maybe_spawn_auto_update_check(rt.handle());
+                if handle.is_some() {
+                    update_rt = Some(rt);
+                }
+                handle
+            }
+            // If even the runtime fails to build, silently skip auto-update.
+            Err(_) => None,
+        },
     };
 
     let choice = vcs_choice(cli.vcs);
@@ -292,41 +312,85 @@ fn main() -> Result<()> {
         Command::Pr { name, refresh } => cmd_pr(&ctx, name, refresh),
     };
 
-    if let Some(handle) = update_check_handle {
-        finalize_auto_update_check(handle);
+    if let (Some(rt), Some(handle)) = (update_rt.as_ref(), update_check_handle) {
+        finalize_auto_update_check(rt.handle(), handle);
     }
 
     result
 }
 
+/// Environment kill-switch name for the background auto-update.
+const AUTO_UPDATE_ENV: &str = "RENRI_NO_AUTOUPDATE";
+
+/// Whether the `RENRI_NO_AUTOUPDATE` env var disables auto-update. Any
+/// non-empty value other than `"0"` / `"false"` (case-insensitive) disables it.
+/// This is checked before config so the kill-switch works even with a broken
+/// `renri.toml`, and takes precedence over the config mode.
+fn auto_update_disabled_by_env() -> bool {
+    match std::env::var(AUTO_UPDATE_ENV) {
+        Ok(v) => {
+            let v = v.trim();
+            !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    }
+}
+
+/// The latest-release payload a spawned background task resolves to.
+type UpdateResult = Result<Option<kaishin::LatestRelease>>;
+
 /// Handle for an ongoing or cached background update check.
+///
+/// The in-flight variants carry a [`tokio::task::JoinHandle`] for a task
+/// spawned on `main`'s runtime at startup, so the network/IO overlaps the
+/// command instead of running on a raw OS worker thread. They are drained with
+/// a short, bounded `tokio::time::timeout` in [`finalize_auto_update_check`].
 enum AutoUpdateHandle {
-    /// A newer version was found in the local cache from a previous run.
+    /// A newer version was found in the local cache from a previous run
+    /// (`notify` mode). Print the banner at shutdown.
     CachedAvailable {
         checker: updater::Checker,
         latest: kaishin::LatestRelease,
     },
-    /// A background check is currently in progress.
+    /// A background notify check is in progress (`notify` mode). Resolve and
+    /// maybe print the banner at shutdown.
     Pending {
         checker: updater::Checker,
-        rx: std::sync::mpsc::Receiver<Result<Option<kaishin::LatestRelease>>>,
+        handle: tokio::task::JoinHandle<UpdateResult>,
         /// A newer version already known from the local cache.
         cached_latest: Option<kaishin::LatestRelease>,
     },
+    /// A silent background install is running as a spawned task (`install`
+    /// mode). At shutdown we briefly wait for it and print a one-line notice
+    /// only if a new binary was actually installed.
+    Installing {
+        handle: tokio::task::JoinHandle<UpdateResult>,
+    },
 }
 
-/// Spawns a background thread to check for updates if the interval has elapsed.
-fn maybe_spawn_auto_update_check() -> Option<AutoUpdateHandle> {
-    // Load config to check if auto_update_check is enabled.
+/// Spawns the background auto-update according to the resolved mode, unless the
+/// env kill-switch disables it. The fetch/install runs as a `tokio` task on
+/// `rt` so it overlaps the command; the handle is consumed by
+/// [`finalize_auto_update_check`] at shutdown.
+fn maybe_spawn_auto_update_check(rt: &tokio::runtime::Handle) -> Option<AutoUpdateHandle> {
+    // Env kill-switch wins, and is checked before loading config so it works
+    // even when `renri.toml` is broken.
+    if auto_update_disabled_by_env() {
+        return None;
+    }
+
     // Try to detect repo root for project-local config.
     let cwd = std::env::current_dir().ok()?;
     let repo_root = vcs::detect(&cwd).map(|r| r.root);
     let loaded = config::Config::load(repo_root.as_deref()).unwrap_or_default();
-    if !loaded.config.ui.auto_update_check {
+
+    // Resolve the mode (pure; the legacy-alias deprecation warning already
+    // fired once at config load time).
+    let mode = loaded.config.ui.update_mode();
+    if mode == config::AutoUpdateMode::Off {
         return None;
     }
 
-    let checker = updater::Checker::new().ok()?;
     let interval = loaded
         .config
         .ui
@@ -335,7 +399,20 @@ fn maybe_spawn_auto_update_check() -> Option<AutoUpdateHandle> {
         .and_then(|s| kaishin::parse_interval(s).ok())
         .unwrap_or_else(updater::default_interval);
 
-    let checker = checker.interval(interval);
+    match mode {
+        config::AutoUpdateMode::Off => None,
+        config::AutoUpdateMode::Notify => spawn_notify_check(rt, interval),
+        config::AutoUpdateMode::Install => spawn_install(rt, interval),
+    }
+}
+
+/// `notify` mode: check (throttled) and surface a banner pointing at
+/// `renri self-update`. Never installs.
+fn spawn_notify_check(
+    rt: &tokio::runtime::Handle,
+    interval: std::time::Duration,
+) -> Option<AutoUpdateHandle> {
+    let checker = updater::Checker::new().ok()?.interval(interval);
 
     if !checker.should_check() {
         if let Some(latest) = checker.cached_update() {
@@ -345,48 +422,82 @@ fn maybe_spawn_auto_update_check() -> Option<AutoUpdateHandle> {
     }
 
     let cached_latest = checker.cached_update();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let checker_clone = updater::Checker::new().ok()?.interval(interval);
-    std::thread::spawn(move || {
-        let _ = tx.send(checker_clone.check_and_save());
-    });
+    let task_checker = checker.clone();
+    let handle = rt.spawn(async move { task_checker.check_and_save().await });
 
     Some(AutoUpdateHandle::Pending {
         checker,
-        rx,
+        handle,
         cached_latest,
     })
 }
 
-/// Waits for the background update check to complete (with a short timeout) and prints a banner if an update is available.
-fn finalize_auto_update_check(handle: AutoUpdateHandle) {
+/// `install` mode: silently download + swap the binary in the background. The
+/// task is fire-and-forget; kaishin handles the throttle, dev-build skip, and
+/// cross-process lock. [`finalize_auto_update_check`] prints a one-line notice
+/// if (and only if) an install actually happened.
+fn spawn_install(
+    rt: &tokio::runtime::Handle,
+    interval: std::time::Duration,
+) -> Option<AutoUpdateHandle> {
+    let checker = updater::Checker::new().ok()?.interval(interval);
+    let handle = rt.spawn(async move { checker.auto_update().await });
+    Some(AutoUpdateHandle::Installing { handle })
+}
+
+/// Surfaces the result of the background auto-update before the binary exits.
+///
+/// Each in-flight task is drained with a short, bounded `tokio::time::timeout`
+/// driven on `rt` — this never blocks an OS worker thread synchronously, and a
+/// still-running task is simply abandoned at process exit.
+///
+/// - `notify` (CachedAvailable / Pending): print the kaishin banner.
+/// - `install` (Installing): wait briefly (so fast commands never hang) and
+///   print exactly one stderr line only if a new binary was actually
+///   installed. All timeouts / errors stay silent.
+fn finalize_auto_update_check(rt: &tokio::runtime::Handle, handle: AutoUpdateHandle) {
     match handle {
         AutoUpdateHandle::CachedAvailable { checker, latest } => {
             eprintln!("\n{}", checker.format_banner(&latest));
         }
         AutoUpdateHandle::Pending {
             checker,
-            rx,
+            handle,
             cached_latest,
         } => {
-            // Wait for 1 second.
-            // kaishin 0.4 で check_and_save が Option を返すようになったので、
-            // Ok(Ok(None)) = 「fetch 成功で更新無し」を区別できる。
-            let res = rx.recv_timeout(std::time::Duration::from_secs(1));
+            // kaishin's check_and_save returns Option, so Ok(Some) =
+            // "fetched fine, update available" is distinct from a timeout/error.
+            let res = rt.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(1), handle).await
+            });
             match res {
-                Ok(Ok(Some(latest))) => {
+                Ok(Ok(Ok(Some(latest)))) => {
                     eprintln!("\n{}", checker.format_banner(&latest));
                 }
-                Ok(Ok(None)) => {
-                    // fetch は成功したがアップデート無し。 cache へのフォールバック
-                    // も不要（最新が現在版に追いついた直後など）。
+                Ok(Ok(Ok(None))) => {
+                    // Fetched fine, no update — and no cache fallback needed.
                 }
                 _ => {
-                    // タイムアウトや fetch エラー時のみ cache を試す。
+                    // Only on timeout / join / fetch error fall back to cache.
                     if let Some(latest) = cached_latest {
                         eprintln!("\n{}", checker.format_banner(&latest));
                     }
                 }
+            }
+        }
+        AutoUpdateHandle::Installing { handle } => {
+            // Short bounded wait so fast commands never hang. Only an actual
+            // install (Ok(Ok(Ok(Some(_))))) produces output; everything else —
+            // throttled, no update, dev build, lock contention, error, join
+            // failure, or timeout — stays silent.
+            let res = rt.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), handle).await
+            });
+            if let Ok(Ok(Ok(Some(latest)))) = res {
+                let version = latest.tag_name.trim_start_matches('v');
+                eprintln!(
+                    "\u{2713} renri {version} installed in the background — restart to apply."
+                );
             }
         }
     }
