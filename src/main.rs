@@ -111,9 +111,10 @@ enum Command {
         merged: bool,
 
         /// Bypass the PR cache and re-fetch from GitHub before reading
-        /// PR state. Useful both for single-target removes (the details
-        /// panel reflects current state) and `--merged` (the candidate
-        /// set reflects current state). Matches `renri list --refresh`.
+        /// PR state, so the details panel reflects current state. Matches
+        /// `renri list --refresh`. Ignored with `--merged`, which always
+        /// re-fetches (acting on a stale cache would skip just-merged
+        /// worktrees).
         #[arg(long)]
         refresh: bool,
     },
@@ -1156,7 +1157,10 @@ fn cmd_remove(
         if name.is_some() {
             anyhow::bail!("--merged operates on the full list; pass either <name> or --merged");
         }
-        return cmd_remove_merged(ctx, yes, force, refresh);
+        // `--merged` always re-fetches the PR cache regardless of `--refresh`
+        // (see cmd_remove_merged) — a stale cache silently drops freshly
+        // merged PRs and makes every worktree "not a candidate".
+        return cmd_remove_merged(ctx, yes, force);
     }
 
     let opened = open_repo_backend(ctx)?;
@@ -1225,7 +1229,12 @@ fn cmd_remove(
 /// Bails before touching anything when (a) the repo's origin isn't on
 /// GitHub, (b) the PR cache is empty (no `gh`, or genuinely no PRs), or
 /// (c) `--non-interactive` is set without `--yes`.
-fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool, refresh: bool) -> Result<()> {
+///
+/// Unlike single-target removal, this always re-fetches the PR cache (the
+/// `--refresh` flag is implied). A TTL-fresh-but-behind cache would silently
+/// miss PRs merged since the last fetch, filtering out every worktree and
+/// printing a misleading "nothing to remove".
+fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool) -> Result<()> {
     use owo_colors::OwoColorize;
     use renri::pr_cache;
 
@@ -1256,7 +1265,10 @@ fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool, refresh: bool) -> Res
     // "nothing to remove" message after candidate filtering is accurate
     // either way, and conflating "tool missing" with "no PRs to act on"
     // produces misleading errors in a fresh repo.
-    let prs = load_pr_cache_for_repo(&opened, &loaded.config, &vcs_ctx, refresh);
+    //
+    // Always refresh (`true`): the swept set is derived entirely from PR
+    // state, so acting on a stale cache would skip just-merged worktrees.
+    let prs = load_pr_cache_for_repo(&opened, &loaded.config, &vcs_ctx, true);
 
     let mut candidates: Vec<(vcs::Worktree, pr_cache::PrInfo, String)> = Vec::new();
     let mut skipped: Vec<(vcs::Worktree, Option<pr_cache::PrInfo>, String)> = Vec::new();
