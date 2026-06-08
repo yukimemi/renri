@@ -57,22 +57,35 @@ pub fn load_or_refresh(
         None => return HashMap::new(),
     };
 
-    let needs_refresh = force
-        || match read_cache(&path) {
-            Some(c) => is_stale(c.fetched_at, ttl_hours),
-            None => true,
-        };
+    let cached = read_cache(&path);
 
-    if needs_refresh {
+    if needs_refresh(force, cached.as_ref().map(|c| c.fetched_at), ttl_hours) {
         if let Ok(prs) = fetch_via_gh(owner, repo) {
             let _ = write_cache(&path, &prs);
             return index_by_branch(prs);
         }
     }
 
-    read_cache(&path)
-        .map(|c| index_by_branch(c.prs))
-        .unwrap_or_default()
+    // Refresh wasn't needed, or `gh` failed — serve whatever was cached.
+    cached.map(|c| index_by_branch(c.prs)).unwrap_or_default()
+}
+
+/// Decide whether to re-fetch from GitHub rather than serve the cache.
+///
+/// `force` wins unconditionally. That's the contract `remove --merged`
+/// relies on: it always passes `force = true` so a *fresh-but-behind*
+/// cache (fetched recently, yet missing PRs merged since) can never
+/// suppress the re-fetch and silently drop just-merged worktrees from the
+/// sweep. Without `force`, refresh only when the cache is missing or older
+/// than the TTL.
+fn needs_refresh(force: bool, cached_fetched_at: Option<u64>, ttl_hours: u64) -> bool {
+    if force {
+        return true;
+    }
+    match cached_fetched_at {
+        Some(fetched_at) => is_stale(fetched_at, ttl_hours),
+        None => true,
+    }
 }
 
 /// Build a `https://github.com/<owner>/<repo>/pull/<number>` URL.
@@ -255,6 +268,45 @@ mod tests {
             .as_secs();
         assert!(is_stale(now.saturating_sub(2 * 3600), 1));
         assert!(!is_stale(now.saturating_sub(60), 24));
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn needs_refresh_force_overrides_fresh_cache() {
+        // The invariant `remove --merged` depends on: with `force = true`
+        // we re-fetch even when the cache is comfortably within its TTL.
+        // A fresh-but-behind cache must never suppress the fetch, or the
+        // sweep silently skips PRs merged since the last refresh.
+        assert!(needs_refresh(true, Some(now_secs()), 24));
+    }
+
+    #[test]
+    fn needs_refresh_serves_fresh_cache_when_not_forced() {
+        assert!(!needs_refresh(
+            false,
+            Some(now_secs().saturating_sub(60)),
+            24
+        ));
+    }
+
+    #[test]
+    fn needs_refresh_refetches_stale_cache_when_not_forced() {
+        assert!(needs_refresh(
+            false,
+            Some(now_secs().saturating_sub(2 * 3600)),
+            1
+        ));
+    }
+
+    #[test]
+    fn needs_refresh_refetches_when_cache_missing() {
+        assert!(needs_refresh(false, None, 24));
     }
 
     fn wt(name: &str, branch: Option<&str>) -> Worktree {
