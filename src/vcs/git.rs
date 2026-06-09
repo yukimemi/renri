@@ -197,6 +197,48 @@ impl Backend for GitBackend {
         // git prints fetch progress / "From origin" lines on stderr.
         Ok(String::from_utf8_lossy(&output.stderr).into_owned())
     }
+
+    fn fetch_remote(&self, remote: &str) -> Result<String> {
+        let output = self
+            .git()
+            .args(["fetch", remote])
+            .output()
+            .context("failed to spawn `git`")?;
+        if !output.status.success() {
+            bail!(
+                "git fetch {remote}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
+    fn referenced_remote(&self, rev: &str) -> Option<String> {
+        let output = self.git().args(["remote"]).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let remotes: Vec<&str> = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .collect();
+        referenced_remote(rev, &remotes).map(str::to_owned)
+    }
+}
+
+/// If `rev` references a remote-tracking ref for one of `remotes`, return that
+/// remote. Git's form is `<remote>/<branch>` (`origin/main`, `origin/main~2`,
+/// `origin/main..HEAD`, `HEAD..origin/main`). The remote must sit at the start
+/// of the rev or right after a `..` range operator **and** be followed by `/`,
+/// so a local branch like `area/fix` isn't mistaken for a ref on a remote
+/// named `a`.
+fn referenced_remote<'a>(rev: &str, remotes: &[&'a str]) -> Option<&'a str> {
+    remotes.iter().copied().find(|r| {
+        let prefix = format!("{r}/");
+        rev.starts_with(&prefix) || rev.contains(&format!("..{prefix}"))
+    })
 }
 
 /// Parse the output of `git worktree list --porcelain`.
@@ -393,6 +435,48 @@ prunable gitdir file points to non-existent location
     #[test]
     fn parse_porcelain_empty() {
         assert_eq!(parse_porcelain(""), vec![]);
+    }
+
+    #[test]
+    fn referenced_remote_matches_remote_branch_forms() {
+        let remotes = ["origin", "upstream"];
+        assert_eq!(referenced_remote("origin/main", &remotes), Some("origin"));
+        assert_eq!(
+            referenced_remote("upstream/main", &remotes),
+            Some("upstream")
+        );
+        // Ranges / suffixes still resolve against the remote ref.
+        assert_eq!(
+            referenced_remote("origin/main..HEAD", &remotes),
+            Some("origin")
+        );
+        assert_eq!(referenced_remote("origin/main~2", &remotes), Some("origin"));
+        // Remote on the far side of a range operator.
+        assert_eq!(
+            referenced_remote("HEAD..upstream/main", &remotes),
+            Some("upstream")
+        );
+    }
+
+    #[test]
+    fn referenced_remote_ignores_local_refs() {
+        let remotes = ["origin"];
+        // A local branch with a slash is not a remote ref.
+        assert_eq!(referenced_remote("feat/x", &remotes), None);
+        assert_eq!(referenced_remote("main", &remotes), None);
+        assert_eq!(referenced_remote("HEAD", &remotes), None);
+        // No configured remotes → nothing references a remote.
+        assert_eq!(referenced_remote("origin/main", &[]), None);
+    }
+
+    #[test]
+    fn referenced_remote_no_false_positive_for_short_remote_name() {
+        // A remote named `a` must not match the local branch `area/fix` just
+        // because it contains `a/` mid-segment.
+        let remotes = ["a"];
+        assert_eq!(referenced_remote("area/fix", &remotes), None);
+        // …but a genuine `a/branch` ref still resolves.
+        assert_eq!(referenced_remote("a/branch", &remotes), Some("a"));
     }
 
     #[test]

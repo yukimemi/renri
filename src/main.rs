@@ -69,6 +69,15 @@ enum Command {
             default_missing_value = ""
         )]
         from: Option<String>,
+
+        /// Skip the automatic `fetch` that runs before resolving a
+        /// `--from <remote-ref>` base (e.g. `main@origin` / `origin/main`).
+        /// By default `add` fetches first so the new worktree forks off the
+        /// current upstream tip rather than a stale locally-cached one; pass
+        /// this to fork off the cached ref as-is (offline, or to pin a known
+        /// local state).
+        #[arg(long)]
+        no_fetch: bool,
     },
 
     /// List existing worktrees / workspaces.
@@ -277,7 +286,11 @@ fn main() -> Result<()> {
         Command::Config {
             sub: ConfigCommand::Show,
         } => cmd_config_show(&ctx),
-        Command::Add { name, from } => cmd_add(&ctx, name, from),
+        Command::Add {
+            name,
+            from,
+            no_fetch,
+        } => cmd_add(&ctx, name, from, no_fetch),
         Command::Remove {
             name,
             yes,
@@ -983,7 +996,7 @@ fn cmd_config_show(ctx: &CmdCtx) -> Result<()> {
     Ok(())
 }
 
-fn cmd_add(ctx: &CmdCtx, name: Option<String>, from: Option<String>) -> Result<()> {
+fn cmd_add(ctx: &CmdCtx, name: Option<String>, from: Option<String>, no_fetch: bool) -> Result<()> {
     // Trim the user-supplied `--from`. An empty string after trim is the
     // signal for "open the picker" (clap's `default_missing_value = ""`),
     // so preserve `Some("")` here instead of filtering it out.
@@ -1054,7 +1067,33 @@ fn cmd_add(ctx: &CmdCtx, name: Option<String>, from: Option<String>) -> Result<(
         Some(ref_str) => Some(ref_str.to_string()),
     };
 
-    let strategy = if opened.primary().branch_exists(&name) {
+    let branch_exists = opened.primary().branch_exists(&name);
+
+    // Fetch before resolving a `--from <remote-ref>` base. The backend
+    // resolves a remote ref like `main@origin` / `origin/main` against its
+    // locally-cached remote-tracking ref, which can lag the actual remote tip
+    // (e.g. a PR merged on GitHub but not yet fetched). Without this the new
+    // worktree forks off a stale base and misses just-merged commits. We fetch
+    // the *specific* remote the ref names (not a hardcoded `origin`) so a
+    // `--from upstream/main` base updates `upstream`. Skipped when attaching to
+    // an existing branch (`--from` is ignored there) and suppressible with
+    // `--no-fetch` for offline / pin-the-cache use.
+    let remote_base = (!no_fetch && !branch_exists)
+        .then_some(from_resolved.as_deref())
+        .flatten()
+        .and_then(|base| opened.primary().referenced_remote(base).map(|r| (base, r)));
+    if let Some((base, remote)) = remote_base {
+        println!("fetching {remote} before resolving {base}");
+        if let Err(e) = opened.primary().fetch_remote(&remote) {
+            // A failed fetch shouldn't block the add — fall back to the cached
+            // ref (the prior behavior) and warn, so an offline user can still
+            // fork off whatever they have.
+            tracing::warn!(error = %e, remote = %remote, "fetch before add failed; using cached refs");
+            eprintln!("warning: fetch failed ({e}); forking off cached {base}");
+        }
+    }
+
+    let strategy = if branch_exists {
         if from_resolved.is_some() {
             tracing::warn!(
                 branch = %name,

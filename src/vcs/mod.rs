@@ -122,6 +122,23 @@ pub trait Backend {
     fn fetch(&self) -> Result<String> {
         Ok(String::new())
     }
+
+    /// Fetch a single named remote: `git fetch <remote>` /
+    /// `jj git fetch --remote <remote>`. Used by `add` so a `--from
+    /// <remote>/<branch>` base that names a non-`origin` remote actually
+    /// updates *that* remote before the base is resolved. Default: no-op.
+    fn fetch_remote(&self, _remote: &str) -> Result<String> {
+        Ok(String::new())
+    }
+
+    /// If `rev` references a remote-tracking ref (so resolving it against the
+    /// locally-cached refs could pick up a stale tip), return the **remote's
+    /// name** so `add` can `fetch` exactly that remote before forking
+    /// `--from <rev>`. Git remote form is `<remote>/<branch>`; jj's is
+    /// `<bookmark>@<remote>`. `None` = not a remote ref. Default: `None`.
+    fn referenced_remote(&self, _rev: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Pick the set of backends to query given the detected repo kind and the
