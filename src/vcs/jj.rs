@@ -495,4 +495,96 @@ impl Backend for JjBackend {
             Ok(stdout.into_owned())
         }
     }
+
+    fn fetch_remote(&self, remote: &str) -> Result<String> {
+        let output = self
+            .jj()
+            .args(["git", "fetch", "--remote", remote])
+            .output()
+            .context("failed to spawn `jj`")?;
+        if !output.status.success() {
+            bail!(
+                "jj git fetch --remote {remote}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stderr.trim().is_empty() {
+            Ok(stderr.into_owned())
+        } else {
+            Ok(stdout.into_owned())
+        }
+    }
+
+    fn referenced_remote(&self, rev: &str) -> Option<String> {
+        let output = self.jj().args(["git", "remote", "list"]).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // `jj git remote list` rows are `<name> <url>` — the remote name is the
+        // first whitespace-delimited token.
+        let remotes: Vec<&str> = stdout
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        referenced_remote(rev, &remotes).map(str::to_owned)
+    }
+}
+
+/// If `rev` references a remote bookmark for one of `remotes`, return that
+/// remote. jj's form is `<bookmark>@<remote>` (e.g. `main@origin`). The remote
+/// must sit at the end of the rev or right before a `..` range operator, so
+/// `@` / `@-` (the working-copy rev) don't match, and a remote named `a`
+/// doesn't match `main@abc`. Revsets embedding a remote bookmark
+/// (`main@origin..@`) still resolve.
+fn referenced_remote<'a>(rev: &str, remotes: &[&'a str]) -> Option<&'a str> {
+    remotes.iter().copied().find(|r| {
+        let suffix = format!("@{r}");
+        rev.ends_with(&suffix) || rev.contains(&format!("{suffix}.."))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::referenced_remote;
+
+    #[test]
+    fn referenced_remote_matches_remote_bookmark_forms() {
+        let remotes = ["origin", "upstream"];
+        assert_eq!(referenced_remote("main@origin", &remotes), Some("origin"));
+        assert_eq!(
+            referenced_remote("main@upstream", &remotes),
+            Some("upstream")
+        );
+        // Revsets embedding a remote bookmark still resolve against it.
+        assert_eq!(
+            referenced_remote("main@origin..@", &remotes),
+            Some("origin")
+        );
+    }
+
+    #[test]
+    fn referenced_remote_ignores_working_copy_and_local_revs() {
+        let remotes = ["origin"];
+        // The working-copy rev and its ancestors are not remote refs.
+        assert_eq!(referenced_remote("@", &remotes), None);
+        assert_eq!(referenced_remote("@-", &remotes), None);
+        // A local bookmark name is not a remote ref.
+        assert_eq!(referenced_remote("main", &remotes), None);
+        assert_eq!(referenced_remote("trunk()", &remotes), None);
+        // No configured remotes → nothing references a remote.
+        assert_eq!(referenced_remote("main@origin", &[]), None);
+    }
+
+    #[test]
+    fn referenced_remote_no_false_positive_for_short_remote_name() {
+        // A remote named `a` must not match `main@abc` just because `@abc`
+        // contains `@a`.
+        let remotes = ["a"];
+        assert_eq!(referenced_remote("main@abc", &remotes), None);
+        // …but a genuine `<bookmark>@a` ref still resolves.
+        assert_eq!(referenced_remote("main@a", &remotes), Some("a"));
+    }
 }
