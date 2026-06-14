@@ -1318,9 +1318,9 @@ dependencies = [
 
 [[package]]
 name = "kaishin"
-version = "0.6.1"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c30d87b09761e983c55c39dfe4a7655366bbc6702a58ef2ff9612548f283bfc9"
+checksum = "cb866f7b2cc028536445944bd9f2943630d6c21b6eaef681d3d4770eab4f1e5b"
 dependencies = [
  "anyhow",
  "console",
