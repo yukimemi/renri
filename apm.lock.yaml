@@ -4,4 +4,9 @@ apm_version: 0.11.0
 dependencies: []
 local_deployed_files:
 - .agents/skills/renri
+- .agents/skills/renri/SKILL.md
 - .claude/skills/renri
+- .claude/skills/renri/SKILL.md
+local_deployed_file_hashes:
+  .agents/skills/renri/SKILL.md: sha256:b0ef8bb599b5dc116a39dc2d3712dd95c722974b91f109a26263052c8d1090d6
+  .claude/skills/renri/SKILL.md: sha256:b0ef8bb599b5dc116a39dc2d3712dd95c722974b91f109a26263052c8d1090d6
