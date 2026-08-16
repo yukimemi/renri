@@ -33,8 +33,18 @@ pub struct Worktree {
     pub path: PathBuf,
     /// Branch (git) or bookmark (jj) name; `None` if detached / anonymous.
     pub branch: Option<String>,
-    /// Short commit / change id of the worktree's HEAD / @-commit.
+    /// Short commit / change id of the worktree's HEAD / @-commit, for
+    /// display. jj reports a *change* id here — stable across rewrites,
+    /// which is what a human wants to see, but not a git object.
     pub head: Option<String>,
+    /// Git commit id of HEAD / the @-commit — the same commit
+    /// [`Self::head`] names, in full object-id form (git reports the
+    /// 40-char porcelain SHA, jj the unabbreviated `commit_id`; `head`
+    /// stays short for display). Kept as its own field because git
+    /// plumbing (patch-id comparison in [`crate::landed`], GitHub's
+    /// commit→PR lookup) needs an object id, and jj's `head` is a *change*
+    /// id — not one.
+    pub commit: Option<String>,
     /// First line of the @-commit / HEAD's description, for `renri list`.
     pub desc: Option<String>,
     /// Working copy has uncommitted changes (git: `status --porcelain`

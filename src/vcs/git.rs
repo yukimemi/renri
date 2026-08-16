@@ -47,12 +47,13 @@ impl Backend for GitBackend {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut wts = parse_porcelain(&stdout);
         // `parse_porcelain` populates `head` with the full 40-char hash from
-        // `--porcelain` output, but the `head` contract is "short id". Reset
-        // it before asking each worktree's repo for the short form, so a
-        // failed `git_head_summary` (e.g. unborn branch) doesn't leave the
-        // long form in place.
+        // `--porcelain` output, but the `head` contract is "short id". Move it
+        // to `commit` (which wants the object id) and reset `head` before
+        // asking each worktree's repo for the short form, so a failed
+        // `git_head_summary` (e.g. unborn branch) doesn't leave the long form
+        // in place.
         for wt in wts.iter_mut() {
-            wt.head = None;
+            wt.commit = wt.head.take();
             if wt.is_stale || wt.is_bare || !wt.path.exists() {
                 continue;
             }
@@ -274,6 +275,7 @@ fn parse_porcelain(text: &str) -> Vec<Worktree> {
                     path,
                     branch: None,
                     head: None,
+                    commit: None,
                     desc: None,
                     dirty: false,
                     conflict: false,

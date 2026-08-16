@@ -92,6 +92,44 @@ renri shell-init fish | source
 Invoke-Expression (& renri shell-init powershell)
 ```
 
+## Sweeping finished worktrees
+
+```sh
+renri remove --merged -y      # delete every worktree whose work is done
+```
+
+"Done" is decided by two independent signals, because **names lie**:
+
+1. **The PR verdict.** A worktree's branch is matched against GitHub PR
+   head refs (`gh`, cached per repo — `[ui] show_pr = true` also renders
+   the result in `renri list`). When the branch match misses, the
+   worktree's HEAD *commit* is looked up instead, so a detached worktree
+   or a renamed branch still resolves to its PR.
+2. **The content verdict.** `git cherry` compares patch-ids against the
+   upstream ref (`origin/HEAD`, falling back to `origin/main` /
+   `origin/master` / local `main` / `master`). This survives GitHub's
+   squash-merge — the squashed commit has the same diff — and ignores
+   names entirely, so it catches the cases where nothing was ever pushed
+   under the worktree's own name.
+
+Either signal is enough to sweep a row; an **open** PR on either vetoes
+it, so work still in review is never deleted even when an identical
+patch already sits upstream (a cherry-pick to a release branch, say).
+Rows the sweep declines to touch are reported rather than dropped
+silently.
+
+Why both: a worktree cut as `identity-1260` but pushed as
+`feat/backend-signing-identity` is invisible to signal 1 and obvious to
+signal 2; one that merged only after review fixes changed its diff is
+the reverse.
+
+Conflicted / locked / dirty worktrees are skipped unless `--force` —
+with one carve-out. In **jj**, the working copy *is* a commit, so "dirty"
+means "`@` has content", which is true of every workspace holding real
+work; when that content is already upstream there is nothing to lose, so
+the dirty veto is lifted. Git worktrees keep it: their dirt is
+*uncommitted* files, which no patch-id comparison can see.
+
 ## AI / agent integration
 
 renri ships as an [APM](https://github.com/microsoft/apm) package.

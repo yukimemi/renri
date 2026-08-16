@@ -9,7 +9,8 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use teravars::{Engine, system_context};
 
 use renri::{
-    config, discovery, hooks, layout, path_display::display_path, picker, shell_init, updater, vcs,
+    config, discovery, hooks, layout, path_display::display_path, picker, shell_init, sweep,
+    updater, vcs,
 };
 
 #[derive(Parser, Debug)]
@@ -112,10 +113,15 @@ enum Command {
         #[arg(long, short = 'f')]
         force: bool,
 
-        /// Remove every worktree whose GitHub PR is merged or closed.
-        /// Dirty / conflicted / locked / main rows are skipped with a
-        /// warning unless `--force` is also passed. Requires the `gh`
-        /// CLI and `[ui] show_pr = true` (or just a GitHub origin).
+        /// Remove every worktree whose work is finished: its GitHub PR is
+        /// merged / closed, or its content is already upstream (patch-id
+        /// comparison against `origin/HEAD`, which sees through
+        /// squash-merges and renamed branches). An open PR on either
+        /// signal vetoes removal. Conflicted / locked / main rows are
+        /// skipped with a warning unless `--force`; so are dirty ones,
+        /// except jj workspaces whose content is already upstream. The PR
+        /// half needs the `gh` CLI and a GitHub origin; the content half
+        /// works offline.
         #[arg(long)]
         merged: bool,
 
@@ -1351,8 +1357,15 @@ fn cmd_remove(
         )
     });
 
+    // One `git cherry` for the single row being removed, so the panel can
+    // say "landed" — the difference between "this worktree still holds the
+    // only copy of something" and "this is a spent checkout".
+    let landed = renri::landed::Probe::discover(&opened.repo.root)
+        .zip(picked.commit.as_deref())
+        .is_some_and(|(p, c)| p.landed(c));
+
     println!();
-    print_worktree_details(&picked, pr_info, pr_url.as_deref());
+    print_worktree_details(&picked, pr_info, pr_url.as_deref(), landed);
     println!();
 
     if !yes && !confirm_remove(ctx, "remove this worktree?")? {
@@ -1370,11 +1383,28 @@ fn cmd_remove(
     Ok(())
 }
 
-/// Auto-remove every worktree whose GitHub PR is `MERGED` or `CLOSED`.
+/// Auto-remove every worktree whose work is done: its GitHub PR is
+/// `MERGED` / `CLOSED`, or its content is already upstream.
 ///
-/// Hard skips: the main worktree, and (unless `--force`) anything dirty /
-/// conflicted / locked. Those land in a warning block printed before the
-/// summary so the user knows what was *not* swept.
+/// **Two independent signals, because names lie.** The PR lookup matches a
+/// worktree's branch against a PR head ref, which misses whenever the two
+/// disagree — an issue-numbered worktree pushed under a `feat/…` branch, a
+/// detached worktree another tool created, a branch that was never pushed.
+/// [`renri::landed`] settles those by content (patch-id vs the upstream
+/// ref), which survives squash-merges and ignores names entirely. Either
+/// signal alone makes a row sweepable; an *open* PR on either vetoes it,
+/// since that work is still in review.
+///
+/// Hard skips: the main worktree, and (unless `--force`) anything
+/// conflicted / locked / dirty. Those land in a warning block printed
+/// before the summary so the user knows what was *not* swept.
+///
+/// The dirty veto is lifted for landed **jj** rows. jj commits the working
+/// copy into `@`, so "dirty" there means "`@` has content" — which is true
+/// of every workspace with real work in it, and would make `--merged`
+/// sweep almost nothing in a jj repo. When that content is already
+/// upstream there is nothing to lose. Git worktrees keep the veto: their
+/// dirt is *uncommitted* files, which no patch-id comparison can see.
 ///
 /// Bails before touching anything when (a) the repo's origin isn't on
 /// GitHub, (b) the PR cache is empty (no `gh`, or genuinely no PRs), or
@@ -1403,11 +1433,32 @@ fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool) -> Result<()> {
         .current_branch()
         .unwrap_or_else(|| "main".into());
     let vcs_ctx = layout::discover_vcs_context(opened.primary(), &opened.repo.root, &branch);
-    if vcs_ctx.owner.is_empty() || vcs_ctx.repo.is_empty() {
-        anyhow::bail!(
-            "could not determine GitHub owner/repo from origin remote; \
-             --merged only works on GitHub-hosted repos"
-        );
+    // Resolved once for the whole sweep — the upstream ref doesn't change
+    // per row. `None` (no git store / no resolvable upstream ref) means no
+    // row can be judged by content.
+    let probe = renri::landed::Probe::discover(&opened.repo.root);
+    // GitHub metadata is optional now that content is a signal in its own
+    // right: a self-hosted / origin-less repo can still be swept by
+    // patch-id. Only the case where *neither* signal is available is a
+    // hard error — there is nothing left to decide with.
+    let github = !(vcs_ctx.owner.is_empty() || vcs_ctx.repo.is_empty());
+    match (github, probe.as_ref()) {
+        (false, None) => anyhow::bail!(
+            "no GitHub origin to read PR state from, and no upstream ref \
+             (origin/HEAD, origin/main, …) to compare content against; \
+             nothing can decide whether a worktree is finished"
+        ),
+        (false, Some(p)) => println!(
+            "{} no GitHub origin — deciding by content against {} only",
+            "note:".yellow(),
+            p.trunk().dimmed()
+        ),
+        (true, Some(p)) => println!(
+            "{} content against {}",
+            "comparing".dimmed(),
+            p.trunk().dimmed()
+        ),
+        (true, None) => {}
     }
 
     // Empty `prs` is ambiguous (no `gh` / network failure / genuinely zero
@@ -1416,11 +1467,25 @@ fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool) -> Result<()> {
     // either way, and conflating "tool missing" with "no PRs to act on"
     // produces misleading errors in a fresh repo.
     //
-    // Always refresh (`true`): the swept set is derived entirely from PR
+    // Always refresh (`true`): the swept set is derived partly from PR
     // state, so acting on a stale cache would skip just-merged worktrees.
-    let prs = load_pr_cache_for_repo(&opened, &loaded.config, &vcs_ctx, true);
+    let prs = if github {
+        load_pr_cache_for_repo(&opened, &loaded.config, &vcs_ctx, true)
+    } else {
+        Default::default()
+    };
 
-    let mut candidates: Vec<(vcs::Worktree, pr_cache::PrInfo, String)> = Vec::new();
+    // `landed` travels with the row rather than being re-derived from
+    // `reason`: a row can be *both* landed and PR-merged, and the panel
+    // reports facts about the worktree while `reason` records which signal
+    // authorized the removal.
+    struct Candidate {
+        w: vcs::Worktree,
+        pr: Option<pr_cache::PrInfo>,
+        reason: sweep::Reason,
+        landed: bool,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
     let mut skipped: Vec<(vcs::Worktree, Option<pr_cache::PrInfo>, String)> = Vec::new();
     for w in worktrees.iter() {
         if w.is_main {
@@ -1428,34 +1493,35 @@ fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool) -> Result<()> {
             // doesn't clutter the warning block in every run.
             continue;
         }
-        let Some(pr) = pr_cache::lookup_for_worktree(w, &prs) else {
+        let landed = match (probe.as_ref(), w.commit.as_deref()) {
+            (Some(p), Some(c)) => p.landed(c),
+            _ => false,
+        };
+        // The commit→PR fallback runs on *every* name-lookup miss, landed
+        // or not. Skipping it for landed rows would save an API call and
+        // silently disable the open-PR veto for exactly the rows that need
+        // it: content already upstream while the PR is still in review
+        // (a cherry-pick to a release branch) resolves only by commit.
+        let pr = pr_cache::lookup_for_worktree(w, &prs).cloned().or_else(|| {
+            if !github {
+                return None;
+            }
+            let commit = w.commit.as_deref()?;
+            pr_cache::lookup_by_commit(&vcs_ctx.owner, &vcs_ctx.repo, commit)
+        });
+        let Some(reason) = sweep::reason(pr.as_ref(), landed) else {
             continue;
         };
-        if pr.state != "MERGED" && pr.state != "CLOSED" {
-            continue;
-        }
-        let mut reasons: Vec<&str> = Vec::new();
-        if !force {
-            if w.dirty {
-                reasons.push("dirty");
-            }
-            if w.conflict {
-                reasons.push("conflict");
-            }
-            if w.is_locked {
-                reasons.push("locked");
-            }
-        }
-        let url = pr_cache::pr_url(
-            vcs_ctx.host.as_deref(),
-            &vcs_ctx.owner,
-            &vcs_ctx.repo,
-            pr.number,
-        );
+        let reasons = sweep::blockers(w, landed, force);
         if reasons.is_empty() {
-            candidates.push((w.clone(), pr.clone(), url));
+            candidates.push(Candidate {
+                w: w.clone(),
+                pr,
+                reason,
+                landed,
+            });
         } else {
-            skipped.push((w.clone(), Some(pr.clone()), reasons.join(",")));
+            skipped.push((w.clone(), pr, reasons.join(",")));
         }
     }
 
@@ -1472,18 +1538,26 @@ fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool) -> Result<()> {
     }
 
     if candidates.is_empty() {
-        println!("nothing to remove (no merged/closed PRs with a removable worktree)");
+        println!("nothing to remove (no finished work with a removable worktree)");
         return Ok(());
     }
 
     println!(
-        "{} {} worktree(s) match merged/closed PRs:",
+        "{} {} finished worktree(s):",
         "found".green().bold(),
         candidates.len()
     );
-    for (w, pr, url) in &candidates {
+    for c in &candidates {
+        let url = c.pr.as_ref().map(|p| {
+            pr_cache::pr_url(
+                vcs_ctx.host.as_deref(),
+                &vcs_ctx.owner,
+                &vcs_ctx.repo,
+                p.number,
+            )
+        });
         println!();
-        print_worktree_details(w, Some(pr), Some(url));
+        print_worktree_details(&c.w, c.pr.as_ref(), url.as_deref(), c.landed);
     }
     println!();
 
@@ -1499,16 +1573,17 @@ fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool) -> Result<()> {
 
     let mut ok = 0usize;
     let mut failed = 0usize;
-    for (w, pr, _url) in &candidates {
-        println!(
-            "removing {} ({} {})",
-            w.name,
-            format!("#{}", pr.number).dimmed(),
-            pr.state.dimmed()
-        );
+    for c in &candidates {
+        let label = match (c.reason, &c.pr) {
+            (sweep::Reason::Pr, Some(p)) => format!("#{} {}", p.number, p.state),
+            // Content is upstream but no PR resolved — say so rather than
+            // printing a bare "(no PR)", which reads like a mistake.
+            _ => "already upstream".to_string(),
+        };
+        println!("removing {} ({})", c.w.name, label.dimmed());
         match remove_one(
             &opened,
-            w,
+            &c.w,
             &loaded.config.hooks.pre_remove,
             &mut engine,
             force,
@@ -1538,10 +1613,16 @@ fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool) -> Result<()> {
 /// Pretty-print everything we know about a worktree, structured like a
 /// short YAML block. Used by both the single-pick and `--merged` flows so
 /// the user sees the same shape of info either way.
+///
+/// `landed` = the content is already upstream (see [`renri::landed`]). It
+/// rides in the status flags rather than getting its own line: it belongs
+/// to the same question as `dirty` / `clean` — is there anything here worth
+/// keeping?
 fn print_worktree_details(
     w: &vcs::Worktree,
     pr: Option<&renri::pr_cache::PrInfo>,
     pr_url: Option<&str>,
+    landed: bool,
 ) {
     use owo_colors::OwoColorize;
 
@@ -1593,6 +1674,11 @@ fn print_worktree_details(
     }
     if w.is_bare {
         flags.push("bare".dimmed().to_string());
+    }
+    if landed {
+        // Magenta to match the MERGED PR state below: both mean "this work
+        // is upstream", one by GitHub's word and one by content.
+        flags.push("landed".magenta().to_string());
     }
     if flags.is_empty() {
         flags.push("clean".green().to_string());
