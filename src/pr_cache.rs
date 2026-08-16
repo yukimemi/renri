@@ -294,6 +294,58 @@ fn fetch_via_gh(owner: &str, repo: &str) -> Result<Vec<PrInfo>> {
     Ok(prs)
 }
 
+/// Ask GitHub which PR a *commit* belongs to, for worktrees the name-based
+/// lookup can't resolve: a worktree cut as `identity-1260` whose PR was
+/// pushed as `feat/backend-signing-identity`, or a detached worktree with
+/// no branch name at all. GitHub still knows the commit, because it was
+/// the PR's head at some point.
+///
+/// **Deliberately uncached.** The name-indexed cache above exists because
+/// one `gh pr list` serves every row; this endpoint is per-commit, and the
+/// only callers hit it for the handful of rows that missed both the name
+/// lookup and the local patch-id probe — typically zero or one per sweep.
+/// Caching that would add a second schema plus a stale-negative failure
+/// mode (a just-merged PR read as "no PR") for no measurable gain.
+///
+/// Returns the best-ranked PR (OPEN > MERGED > CLOSED) so a commit that
+/// also sits on an open follow-up PR reads as OPEN and stays un-swept.
+/// `None` on any failure — no `gh`, no network, unknown commit (a purely
+/// local commit GitHub has never seen answers 422 here).
+pub fn lookup_by_commit(owner: &str, repo: &str, commit: &str) -> Option<PrInfo> {
+    // The REST shape differs from `gh pr list`'s GraphQL one: `state` is
+    // lowercase and doesn't distinguish merged from closed, and the head
+    // ref lives at `.head.ref`. Normalize server-side via jq so the rest
+    // of renri sees the same uppercase `OPEN`/`MERGED`/`CLOSED` vocabulary.
+    let jq = r#"map({
+        number,
+        state: (if .merged_at then "MERGED" else (.state | ascii_upcase) end),
+        head_ref_name: .head.ref
+    })"#;
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/{owner}/{repo}/commits/{commit}/pulls"),
+            "--jq",
+            jq,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let prs: Vec<PrInfo> = serde_json::from_slice(&output.stdout).ok()?;
+    best_ranked(prs)
+}
+
+/// Lowest [`state_rank`] wins, ties broken by lower PR number so the pick
+/// is deterministic.
+fn best_ranked(prs: Vec<PrInfo>) -> Option<PrInfo> {
+    prs.into_iter().reduce(|a, b| {
+        let better = (state_rank(&b.state), b.number) < (state_rank(&a.state), a.number);
+        if better { b } else { a }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +366,27 @@ mod tests {
         ];
         let map = index_by_branch(prs);
         assert_eq!(map["feat/x"].number, 2);
+    }
+
+    #[test]
+    fn best_ranked_prefers_open_then_lower_number() {
+        // A commit can belong to several PRs (reopened, or cherry-picked
+        // into a follow-up). OPEN must win so `remove --merged` never
+        // deletes a checkout whose work is still under review.
+        let picked = best_ranked(vec![
+            pr(9, "MERGED", "feat/x"),
+            pr(7, "OPEN", "feat/x"),
+            pr(3, "CLOSED", "feat/x"),
+        ])
+        .unwrap();
+        assert_eq!(picked.number, 7);
+
+        // Same state → lowest number, so the pick doesn't depend on the
+        // order GitHub happened to return.
+        let picked = best_ranked(vec![pr(9, "MERGED", "a"), pr(4, "MERGED", "b")]).unwrap();
+        assert_eq!(picked.number, 4);
+
+        assert!(best_ranked(vec![]).is_none());
     }
 
     #[test]
@@ -371,6 +444,7 @@ mod tests {
             path: std::path::PathBuf::new(),
             branch: branch.map(String::from),
             head: None,
+            commit: None,
             desc: None,
             dirty: false,
             conflict: false,

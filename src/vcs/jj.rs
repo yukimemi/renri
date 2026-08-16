@@ -125,13 +125,23 @@ impl JjBackend {
             .unwrap_or_else(|| "@".to_string())
     }
 
-    /// Look up the @-commit's short change id, bookmark list, description
-    /// first line, and dirty / conflict flags in a single `jj log` call.
+    /// Look up the @-commit's short change id, git commit id, bookmark list,
+    /// description first line, and dirty / conflict flags in a single
+    /// `jj log` call.
     fn workspace_status(&self, name: &str) -> Option<JjStatus> {
         // Sentinel \x1f (ASCII unit separator) keeps fields apart even if
-        // descriptions contain tabs or commas. Order: id, bookmarks, dirty
-        // ("1" = non-empty @ = WC has changes), conflict, desc.
+        // descriptions contain tabs or commas. Order: id, commit, bookmarks,
+        // dirty ("1" = non-empty @ = WC has changes), conflict, desc.
+        //
+        // `commit_id` (unabbreviated) rides along in the same template
+        // rather than in a second `jj log` call: it costs nothing here, and
+        // the landed probe needs a git object id (a change id is not one)
+        // for every row. Full, not `.short()` — an abbreviated id is a
+        // *prefix*, and GitHub's commit endpoint documents a full
+        // `commit_sha`; resolving prefixes is a courtesy we shouldn't lean
+        // on, and one that fails outright on a prefix collision.
         let template = "self.change_id().short() ++ \"\\x1f\" \
+                        ++ self.commit_id() ++ \"\\x1f\" \
                         ++ self.bookmarks().map(|b| b.name()).join(\",\") ++ \"\\x1f\" \
                         ++ if(self.empty(), \"0\", \"1\") ++ \"\\x1f\" \
                         ++ if(self.conflict(), \"1\", \"0\") ++ \"\\x1f\" \
@@ -152,8 +162,13 @@ impl JjBackend {
             return None;
         }
         let s = String::from_utf8_lossy(&output.stdout);
-        let mut parts = s.splitn(5, '\x1f');
+        let mut parts = s.splitn(6, '\x1f');
         let id = parts.next()?.trim().to_string();
+        let commit = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         let bookmarks = parts
             .next()
             .map(str::trim)
@@ -171,6 +186,7 @@ impl JjBackend {
         } else {
             Some(JjStatus {
                 id,
+                commit,
                 bookmarks,
                 dirty,
                 conflict,
@@ -182,6 +198,7 @@ impl JjBackend {
 
 struct JjStatus {
     id: String,
+    commit: Option<String>,
     bookmarks: Option<String>,
     dirty: bool,
     conflict: bool,
@@ -229,12 +246,19 @@ impl Backend for JjBackend {
                 None => (PathBuf::new(), true),
             };
 
-            let (head, branch, desc, dirty, conflict) = if is_stale {
-                (None, None, None, false, false)
+            let (head, commit, branch, desc, dirty, conflict) = if is_stale {
+                (None, None, None, None, false, false)
             } else {
                 match self.workspace_status(&name) {
-                    Some(st) => (Some(st.id), st.bookmarks, st.desc, st.dirty, st.conflict),
-                    None => (None, None, None, false, false),
+                    Some(st) => (
+                        Some(st.id),
+                        st.commit,
+                        st.bookmarks,
+                        st.desc,
+                        st.dirty,
+                        st.conflict,
+                    ),
+                    None => (None, None, None, None, false, false),
                 }
             };
 
@@ -243,6 +267,7 @@ impl Backend for JjBackend {
                 path,
                 branch,
                 head,
+                commit,
                 desc,
                 dirty,
                 conflict,

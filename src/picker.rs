@@ -114,6 +114,7 @@ mod tests {
             path: PathBuf::from(format!("/wt/{name}")),
             branch: branch.map(String::from),
             head: None,
+            commit: None,
             desc: None,
             dirty: false,
             conflict: false,
