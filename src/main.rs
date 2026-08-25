@@ -121,7 +121,7 @@ enum Command {
         /// skipped with a warning unless `--force`; so are dirty ones,
         /// except jj workspaces whose content is already upstream. The PR
         /// half needs the `gh` CLI and a GitHub origin; the content half
-        /// works offline.
+        /// works offline (against whatever the last fetch left behind).
         #[arg(long)]
         merged: bool,
 
@@ -132,6 +132,25 @@ enum Command {
         /// worktrees).
         #[arg(long)]
         refresh: bool,
+
+        /// Skip the automatic `fetch` that runs before deciding whether a
+        /// worktree's work is already upstream.
+        ///
+        /// By default `remove` fetches first, because the content signal is
+        /// a patch-id comparison against a *local* `origin/HEAD` that
+        /// nothing else updates — and sweeping right after a merge is
+        /// exactly when that ref is a commit behind. Pass this to judge
+        /// against the cached refs (offline, or to pin a known local
+        /// state).
+        ///
+        /// Single-target removal skips the fetch under `-y` on its own:
+        /// there the verdict is only printed for you to read at the
+        /// prompt, and with `-y` there is no prompt — the panel then says
+        /// `landed?` rather than claiming either way. This flag still gets
+        /// a verdict, from the cache. `--merged` always fetches, because
+        /// there the verdict decides.
+        #[arg(long)]
+        no_fetch: bool,
     },
 
     /// Print the absolute path of a worktree (designed to be used from a
@@ -303,7 +322,8 @@ fn main() -> Result<()> {
             force,
             merged,
             refresh,
-        } => cmd_remove(&ctx, name, yes, force, merged, refresh),
+            no_fetch,
+        } => cmd_remove(&ctx, name, yes, force, merged, refresh, no_fetch),
         Command::Cd { name } => cmd_cd(&ctx, name),
         Command::Exec { name, argv } => cmd_exec(&ctx, name, argv),
         Command::Prune => cmd_prune(&ctx),
@@ -1308,6 +1328,7 @@ fn cmd_remove(
     force: bool,
     merged: bool,
     refresh: bool,
+    no_fetch: bool,
 ) -> Result<()> {
     if merged {
         if name.is_some() {
@@ -1316,7 +1337,7 @@ fn cmd_remove(
         // `--merged` always re-fetches the PR cache regardless of `--refresh`
         // (see cmd_remove_merged) — a stale cache silently drops freshly
         // merged PRs and makes every worktree "not a candidate".
-        return cmd_remove_merged(ctx, yes, force);
+        return cmd_remove_merged(ctx, yes, force, no_fetch);
     }
 
     let opened = open_repo_backend(ctx)?;
@@ -1359,10 +1380,26 @@ fn cmd_remove(
 
     // One `git cherry` for the single row being removed, so the panel can
     // say "landed" — the difference between "this worktree still holds the
-    // only copy of something" and "this is a spent checkout".
-    let landed = renri::landed::Probe::discover(&opened.repo.root)
-        .zip(picked.commit.as_deref())
-        .is_some_and(|(p, c)| p.landed(c));
+    // only copy of something" and "this is a spent checkout". Fetched
+    // first, or the answer is about whenever this checkout last looked.
+    //
+    // Under `-y` neither happens. Here `landed` is read by exactly one
+    // thing — the human at the prompt below; nothing downstream branches on
+    // it, unlike `--merged`, where it *is* the decision — and with `-y`
+    // there is no prompt. So a network round trip would buy a line in a log
+    // nobody is deciding from, and printing that line off unrefreshed refs
+    // would be the same quiet misinformation this whole fix is about. No
+    // fetch, no claim: the panel says `landed?`.
+    //
+    // `--no-fetch` is different and does still get a verdict: asking for
+    // the cached answer is asking for an answer.
+    let ask_landed = !yes || no_fetch;
+    refresh_upstream_refs(&opened, no_fetch || yes);
+    let landed = ask_landed.then(|| {
+        renri::landed::Probe::discover(&opened.repo.root)
+            .zip(picked.commit.as_deref())
+            .is_some_and(|(p, c)| p.landed(c))
+    });
 
     println!();
     print_worktree_details(&picked, pr_info, pr_url.as_deref(), landed);
@@ -1381,6 +1418,44 @@ fn cmd_remove(
         force,
     )?;
     Ok(())
+}
+
+/// Update remote-tracking refs before anything asks whether a worktree's
+/// work is already upstream.
+///
+/// `remove`'s content signal is a patch-id comparison against
+/// `origin/HEAD` — a **local** ref that nothing updates on its own. The
+/// moment a sweep gets run is right after something merged, which is
+/// exactly the moment that ref is a commit behind, so the row reads as
+/// not-upstream. In a jj repo that also swallows the row entirely: `dirty`
+/// there means "`@` has content", true of every workspace holding work, and
+/// the veto on it is lifted only for rows the content signal cleared. A
+/// just-merged jj workspace therefore reported `MERGED — dirty` and was
+/// skipped, which reads as renri not understanding jj. It was renri
+/// answering a question about whenever this checkout last looked.
+///
+/// `add` already fetches for the same reason, and `--merged` already
+/// force-refreshes the *PR* cache for the same reason. This is the third
+/// side of that: a stale input is a stale answer.
+///
+/// Best-effort, per the resilience rule: an unreachable remote leaves the
+/// cached refs in place and the caller carries on, so the offline promise
+/// in `--merged`'s help text still holds. Every backend is fetched for the
+/// reason [`cmd_sync`] gives — in a colocated repo the two update
+/// git-refs and jj-bookmarks through different code paths.
+fn refresh_upstream_refs(opened: &OpenedRepo, no_fetch: bool) {
+    if no_fetch {
+        return;
+    }
+    for (kind, backend) in &opened.backends {
+        if let Err(e) = backend.fetch() {
+            tracing::warn!(backend = backend.name(), error = %e, "fetch failed");
+            eprintln!(
+                "[{}] fetch failed, judging against cached refs: {e}",
+                vcs::kind_short(*kind)
+            );
+        }
+    }
 }
 
 /// Auto-remove every worktree whose work is done: its GitHub PR is
@@ -1413,8 +1488,10 @@ fn cmd_remove(
 /// Unlike single-target removal, this always re-fetches the PR cache (the
 /// `--refresh` flag is implied). A TTL-fresh-but-behind cache would silently
 /// miss PRs merged since the last fetch, filtering out every worktree and
-/// printing a misleading "nothing to remove".
-fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool) -> Result<()> {
+/// printing a misleading "nothing to remove". [`refresh_upstream_refs`] is
+/// the same argument for the *content* signal, which had no such refresh
+/// and so answered against whatever the last fetch left behind.
+fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool, no_fetch: bool) -> Result<()> {
     use owo_colors::OwoColorize;
     use renri::pr_cache;
 
@@ -1435,7 +1512,10 @@ fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool) -> Result<()> {
     let vcs_ctx = layout::discover_vcs_context(opened.primary(), &opened.repo.root, &branch);
     // Resolved once for the whole sweep — the upstream ref doesn't change
     // per row. `None` (no git store / no resolvable upstream ref) means no
-    // row can be judged by content.
+    // row can be judged by content. Fetched first: the ref it compares
+    // against is local, and the moment a sweep is most likely to be run is
+    // the moment it is most likely to be behind.
+    refresh_upstream_refs(&opened, no_fetch);
     let probe = renri::landed::Probe::discover(&opened.repo.root);
     // GitHub metadata is optional now that content is a signal in its own
     // right: a self-hosted / origin-less repo can still be swept by
@@ -1557,7 +1637,9 @@ fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool) -> Result<()> {
             )
         });
         println!();
-        print_worktree_details(&c.w, c.pr.as_ref(), url.as_deref(), c.landed);
+        // Always `Some` here: the sweep cannot reach a candidate without
+        // having asked, since the verdict is half of what selects it.
+        print_worktree_details(&c.w, c.pr.as_ref(), url.as_deref(), Some(c.landed));
     }
     println!();
 
@@ -1618,11 +1700,17 @@ fn cmd_remove_merged(ctx: &CmdCtx, yes: bool, force: bool) -> Result<()> {
 /// rides in the status flags rather than getting its own line: it belongs
 /// to the same question as `dirty` / `clean` — is there anything here worth
 /// keeping?
+///
+/// `None` means it was never asked, and prints `landed?` rather than
+/// nothing: an absent flag is how this panel says "not upstream", so
+/// staying silent would turn "we did not look" into an answer. That is the
+/// state `remove <name> -y` is in — no prompt to inform, so no fetch, so
+/// no claim.
 fn print_worktree_details(
     w: &vcs::Worktree,
     pr: Option<&renri::pr_cache::PrInfo>,
     pr_url: Option<&str>,
-    landed: bool,
+    landed: Option<bool>,
 ) {
     use owo_colors::OwoColorize;
 
@@ -1675,10 +1763,12 @@ fn print_worktree_details(
     if w.is_bare {
         flags.push("bare".dimmed().to_string());
     }
-    if landed {
+    match landed {
         // Magenta to match the MERGED PR state below: both mean "this work
         // is upstream", one by GitHub's word and one by content.
-        flags.push("landed".magenta().to_string());
+        Some(true) => flags.push("landed".magenta().to_string()),
+        Some(false) => {}
+        None => flags.push("landed?".dimmed().to_string()),
     }
     if flags.is_empty() {
         flags.push("clean".green().to_string());

@@ -99,6 +99,30 @@ before reverting any of them.
   `jj workspace prune`. We list workspaces and forget the ones whose
   root path is gone. This is one of the main reasons renri exists
   for jj users — flag with the user before changing how it behaves.
+- **Every "is this upstream?" answer is only as fresh as the last
+  fetch, so the commands that ask, fetch.** `add` fetches before
+  resolving a `--from` base; `remove --merged` force-refreshes the PR
+  cache; `remove` (both forms) fetches remote refs before
+  `landed::Probe` compares patch-ids. That third one was missing until
+  the fetch landed, and the symptom did not look like staleness: a jj
+  workspace whose PR had *just* merged reported `MERGED — dirty` and was
+  skipped, because the jj dirty carve-out is keyed on the **content**
+  verdict, which was still comparing against yesterday's
+  `origin/HEAD`. It read as "renri does not really support jj". The
+  policy in `sweep.rs` was never wrong; its input was. Any new caller
+  of `landed::Probe` needs the same treatment — and each fetch stays
+  best-effort, so offline use degrades to the cached refs instead of
+  failing (`tests/remove_merged_freshness.rs` pins both directions
+  with a real repo, since no unit test can see this).
+- **A verdict nobody refreshed is not printed as a verdict.** The
+  corollary of the bullet above: single-target `remove -y` skips the
+  fetch, because there `landed` only informs the prompt and `-y` means
+  there is no prompt — so the panel prints `landed?` rather than
+  omitting the flag, since an absent flag is how it says *not*
+  upstream. `--no-fetch` still answers, from the cache, because asking
+  for the cached answer is asking for an answer. Hence
+  `print_worktree_details` takes `Option<bool>`: any future caller that
+  cannot be bothered to look has to say so rather than pass `false`.
 - **AI integration goes through APM.** The skill at
   `.apm/skills/renri/SKILL.md` is the single source of truth;
   Microsoft's [APM](https://github.com/microsoft/apm) compiles it

@@ -130,6 +130,22 @@ work; when that content is already upstream there is nothing to lose, so
 the dirty veto is lifted. Git worktrees keep it: their dirt is
 *uncommitted* files, which no patch-id comparison can see.
 
+**`remove` fetches first.** The content verdict compares against a
+*local* ref, and the moment a sweep gets run is right after something
+merged — exactly when that ref is a commit behind. Left stale it reports
+"nothing to remove" for the worktree you just merged, and in a jj repo it
+keeps the row outright: `dirty` there is always true, and the veto on it
+is lifted only for rows the content verdict cleared. So `remove` refreshes
+remote refs before judging, the way `add` already does before resolving a
+base. An unreachable remote is not fatal — it falls back to the cached
+refs — and `--no-fetch` skips it deliberately. Single-target
+`renri remove <name>` skips it under `-y` too: there the verdict is only
+printed for you to read at the prompt, and `-y` is you having already
+decided. It then prints `landed?` rather than nothing, because an absent
+flag is how the panel says *not* upstream — "we did not look" is not an
+answer. `--no-fetch` still gets a verdict: asking for the cached answer is
+asking for an answer.
+
 ## AI / agent integration
 
 renri ships as an [APM](https://github.com/microsoft/apm) package.
