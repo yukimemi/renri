@@ -1,0 +1,99 @@
+# magi competing on its own repository.
+#
+# **Only what is peculiar to this checkout lives here.** The roster, the seat
+# assignment, the shape of a run and the update policy moved to the machine
+# layer (`<config_dir>/magi/config.toml`), because none of them are facts about
+# this repository: they are facts about which agent CLIs are installed and what
+# the operator is willing to spend. Stating them once there is the point of
+# having layers, and it keeps this file to the things a different machine would
+# still need to be told.
+#
+# What that leaves, and why each one has to be here:
+#
+# - `[verify]` runs `cargo`. A repository that is not Rust cannot inherit it,
+#   and the machine layer does not set `verify` at all — an unset `verify.gate`
+#   makes magi report every run clean without checking anything
+#   (`!self.state.gate.is_empty()` in `src/graph.rs`), so this is the one
+#   section whose absence fails silently instead of loudly.
+# - `[merge] base` names this repository's branch. The machine layer already
+#   defaults this to `"main"` for every jj-colocated checkout on this machine,
+#   and renri's default branch happens to be `main` too, so this line is
+#   currently a no-op in practice. It is restated anyway: the fact is about
+#   this repository (its default branch), not about the machine, and a repo
+#   file that relies on a machine-layer coincidence breaks silently the day
+#   either one changes (a different machine, or a default-branch rename here).
+# - `[prompts]` are this project's conventions. The machine layer already
+#   carries the same jj-colocated warning (for the same reason as `[merge]`
+#   above), restated here for the same reason: it is a fact about this
+#   repository's VCS setup, not about the machine running it.
+#
+# Note that an array may be declared in exactly one layer
+# (`Config::refuse_split_arrays`), so `[verify]`'s arrays being here is also
+# why the roster's arrays are *only* over there.
+#
+# Rendered by teravars. Tera braces are live everywhere in this file, but
+# comments are stripped before Tera sees them (teravars >= 0.2.2), so a comment
+# may quote `{{ ... }}` freely.
+
+[vars]
+# Shared build cache for the verification commands. Override per machine with
+# MAGI_CACHE. Lives beside its only consumer: `[vars]` is rendered per file, so
+# a value used by this file's templates is stated in this file.
+cache = "{{ env.MAGI_CACHE | default(value='/tmp') }}"
+
+[verify]
+# The real-machine leg, run in the winner's worktree once per review round.
+#
+# CARGO_TARGET_DIR is shared on purpose: each candidate worktree would otherwise
+# compile this crate from scratch, which is by far the slowest thing in a run on
+# a Rust repo (minutes, against ~90 s of agent latency per node). Only the
+# winner's worktree runs these commands, and only one at a time, so nothing
+# contends on cargo's lock.
+e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/renri-target cargo test --locked --all-targets"]
+# Same set `.github/workflows/ci.yml` gates on: `cargo make check` (see
+# Makefile.toml's `[tasks.check]`, which is documented as "same as CI") runs
+# editorconfig-check + fmt-check + clippy + test (targets + doc) + lock-check,
+# covering CI's editorconfig / fmt / clippy / test / lockfile jobs. CI's plain
+# `check` job (`cargo check --all-targets`) is subsumed by lock-check's
+# stricter `cargo check --locked --all-targets`.
+#
+# CI's `coverage` job (cargo-llvm-cov + Codecov upload) is deliberately left
+# out: it needs a `CODECOV_TOKEN` secret this environment doesn't have, its
+# upload step already tolerates failure (`fail_ci_if_error: false`), and it
+# asserts no coverage threshold — the only way it can fail is the compile
+# step, which `test` and `lock-check` above already cover. It reports, it does
+# not gate, so a red PR is never caused by skipping it here.
+#
+# A gate that diverges from CI is the one failure mode this whole setup can't
+# absorb: a clean magi run would still turn into a red PR.
+#
+# `cargo make check`'s own `editorconfig-check` task soft-skips (exit 0) when
+# the `editorconfig-checker` binary isn't on PATH, instead of hard-failing like
+# CI's action-installed copy does. That gap is left alone rather than papered
+# over with a second, unconditional `editorconfig-checker` invocation here:
+# whether that binary is on PATH varies by shell and by whichever worktree
+# ends up running the gate, so hard-requiring it would turn a missing local
+# tool into a gate failure unrelated to the code under review — trading a
+# silent false-clean for a spurious false-red, which is no better a match for
+# CI. `Makefile.toml` and `ci.yml` both reference `editorconfig-check`, which
+# is the parity this file is responsible for; installing the tool everywhere
+# the gate might run is a machine-provisioning concern, not this file's.
+gate = ["CARGO_TARGET_DIR={{ vars.cache }}/renri-target cargo make check"]
+
+[merge]
+mode = "none"
+# Required here, and in every jj-colocated repo: jj keeps git's HEAD detached at
+# the working-copy commit, so magi cannot infer the base branch from
+# `git symbolic-ref HEAD`. Teaching magi to read the jj bookmark instead is a
+# real feature, not a workaround.
+base = "main"
+
+# Project conventions appended to the node prompts, never merged into them.
+# Repository-wide context lives in AGENTS.md, which every agent already reads
+# from the checkout; these are the things a magi *node* needs to know.
+[prompts]
+all = """
+This repository uses jj (Jujutsu) with a colocated git repo. `git commit` works \
+in a candidate worktree and is what magi expects, but never run `jj` commands \
+and never touch the main working copy.
+"""
