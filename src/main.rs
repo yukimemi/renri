@@ -206,8 +206,8 @@ enum Command {
 
     /// Print a shell-completion script for the given shell. Pipe into your
     /// shell's completion-loader, e.g.
-    /// `renri completions bash > ~/.local/share/bash-completion/completions/renri`.
-    Completions {
+    /// `renri completion bash > ~/.local/share/bash-completion/completions/renri`.
+    Completion {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
@@ -275,11 +275,11 @@ fn main() -> Result<()> {
     // a spawned task that overlaps the command (mirrors rvpm). One worker is
     // enough: the task is mostly network/IO-bound and is drained with a short,
     // bounded timeout at shutdown. Built lazily so commands that never spawn an
-    // update (self-update / completions, or a disabled config) don't pay for
+    // update (self-update / completion, or a disabled config) don't pay for
     // it; `None` means we never needed a runtime.
     let mut update_rt: Option<tokio::runtime::Runtime> = None;
     let update_check_handle = match cli.command {
-        Command::SelfUpdate { .. } | Command::Completions { .. } => None,
+        Command::SelfUpdate { .. } | Command::Completion { .. } => None,
         _ => match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -339,7 +339,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Sync => cmd_sync(&ctx),
-        Command::Completions { shell } => {
+        Command::Completion { shell } => {
             let mut cmd = Cli::command();
             let bin = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, bin, &mut std::io::stdout());
