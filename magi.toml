@@ -81,16 +81,6 @@ e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/renri-target cargo test --locked --all
 gate = ["CARGO_TARGET_DIR={{ vars.cache }}/renri-target cargo make check"]
 
 [merge]
-# Restated here, overriding the machine layer's `mode = "pr"`, because this
-# file was carried over verbatim from the magi run that produced it
-# (review/gate already passed on this exact content) rather than re-authored
-# for landing. That run predates this line ever being reconsidered against
-# the machine layer's later switch to `"pr"` — the override is real, but
-# whether it is what this repository *should* want going forward is an open
-# question, not a decision made here: asked via `magi ask` as question 988a.
-# Until that resolves, leave this as `"none"` rather than silently adopting
-# either answer.
-mode = "none"
 # Required here, and in every jj-colocated repo: jj keeps git's HEAD detached at
 # the working-copy commit, so magi cannot infer the base branch from
 # `git symbolic-ref HEAD`. Teaching magi to read the jj bookmark instead is a
