@@ -17,7 +17,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 clap_complete = "4.6.11"
 inquire = "0.9.4"
 serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.1.7"
+toml = "1.1.8"
 anyhow = "1.0.104"
 thiserror = "2.0.21"
 tracing = "0.1.44"
