@@ -1,7 +1,44 @@
 lockfile_version: '1'
-generated_at: '2026-05-02T14:27:42.068581+00:00'
+generated_at: '2026-10-26T04:21:39.917073+00:00'
 apm_version: 0.11.0
 dependencies: []
+deployments:
+- kind: project-relative
+  target: claude
+  value: .claude/skills/renri
+  runtime: null
+  scope: project
+  owners:
+  - .
+  active_owner: .
+  content_hash: null
+- kind: project-relative
+  target: claude
+  value: .claude/skills/renri/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - .
+  active_owner: .
+  content_hash: sha256:b0ef8bb599b5dc116a39dc2d3712dd95c722974b91f109a26263052c8d1090d6
+- kind: project-relative
+  target: copilot
+  value: .agents/skills/renri
+  runtime: null
+  scope: project
+  owners:
+  - .
+  active_owner: .
+  content_hash: null
+- kind: project-relative
+  target: copilot
+  value: .agents/skills/renri/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - .
+  active_owner: .
+  content_hash: sha256:b0ef8bb599b5dc116a39dc2d3712dd95c722974b91f109a26263052c8d1090d6
 local_deployed_files:
 - .agents/skills/renri
 - .agents/skills/renri/SKILL.md
