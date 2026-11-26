@@ -18,7 +18,7 @@ clap_complete = "4.6.12"
 inquire = "0.9.5"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.2"
-anyhow = "1.0.104"
+anyhow = "1.0.105"
 thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
